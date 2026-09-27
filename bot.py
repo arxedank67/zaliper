@@ -3,6 +3,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from aiohttp import web
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, ContextTypes
@@ -66,10 +67,9 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
     logger.info(f"[DEBUG] Твит {tweet.id}: найдено {len(photos)} фото")
 
     photos_to_send = []
-    for i, photo in enumerate(photos[:10]):  # Лимит 10 фото
+    for i, photo in enumerate(photos[:10]):
         url = getattr(photo, "url", None)
         if not url:
-            # Резервный вариант — собрать URL из id
             pid = getattr(photo, "id", None)
             if pid:
                 url = f"https://pbs.twimg.com/media/{pid}.jpg"
@@ -96,7 +96,6 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
         logger.warning(f"[DEBUG] Твит {tweet.id}: ни одна картинка не скачалась")
         return 0
 
-    # Отправляем в Telegram
     try:
         caption = (
             f"🔗 [Ссылка на пост](https://x.com/i/status/{tweet.id})\n"
@@ -246,26 +245,47 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
-# --- Точка входа ---
+# --- Веб-сервер для Render ---
 
-def main():
-    """Запускает бота."""
-    if not BOT_TOKEN:
-        logger.error("Укажите BOT_TOKEN в переменных окружения!")
-        return
+async def health_check(request):
+    """Отвечает 'OK' на пинги Render и UptimeRobot."""
+    return web.Response(text="Bot is alive!")
 
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("add_account", add_account))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("search", search))
-
+async def start_web_server():
+    """Запускает мини-сервер на порту, который требует Render."""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Бот запущен. Порт: {port}")
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Веб-сервер для Render запущен на порту {port}")
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# --- Запуск бота ---
+
+async def run_bot():
+    """Запускает Telegram-бота в режиме polling."""
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("add_account", add_account))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("search", search))
+
+    logger.info("Telegram-бот запущен.")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+async def main_async():
+    """Запускает и веб-сервер, и бота одновременно."""
+    await asyncio.gather(
+        start_web_server(),
+        run_bot()
+    )
 
 
 if __name__ == "__main__":
@@ -273,4 +293,11 @@ if __name__ == "__main__":
     print("BOT_TOKEN задан:", bool(BOT_TOKEN), flush=True)
     print("ALLOWED_USER_ID:", ALLOWED_USER_ID, flush=True)
     print("PORT:", os.environ.get("PORT"), flush=True)
-    main()
+
+    if not BOT_TOKEN:
+        logger.error("Укажите BOT_TOKEN в переменных окружения!")
+    else:
+        try:
+            asyncio.run(main_async())
+        except (KeyboardInterrupt, SystemExit):
+            pass
