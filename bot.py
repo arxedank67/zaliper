@@ -57,7 +57,6 @@ HEADERS = {
 
 
 # ---- Модель пользователя ----
-
 @dataclass
 class UserState:
     user_id: int
@@ -114,7 +113,6 @@ def is_owner(user_id: int) -> bool:
 
 
 # ---- Утилиты ----
-
 def esc(s: str) -> str:
     return html.escape(s or "")
 
@@ -132,8 +130,7 @@ def track_sent(chat_id: int, *messages):
         SENT_MESSAGES[chat_id] = SENT_MESSAGES[chat_id][-MAX_TRACKED_PER_CHAT // 2:]
 
 
-# ---- Dedup ----
-
+# ---- Per-user dedup ----
 def is_sent(user: UserState, tweet_id: int) -> bool:
     if not user.dedup_enabled:
         return False
@@ -190,7 +187,6 @@ async def user_cleanup_loop():
 
 
 # ---- X account helpers ----
-
 async def add_x_account(user: UserState, auth_token: str, ct0: str) -> bool:
     try:
         api = get_x_api(user)
@@ -233,7 +229,6 @@ async def ensure_owner_account():
 
 
 # ---- Типы медиа ----
-
 def tweet_matches_media_type(tweet: Tweet, media_type: str | None) -> bool:
     if media_type in (None, "any"):
         return True
@@ -262,7 +257,6 @@ def media_type_icon(mt: str | None) -> str:
 
 
 # ---- Отправка ----
-
 async def send_tweet_to(chat_id: int, photos: list, caption: str,
                         context: ContextTypes.DEFAULT_TYPE):
     if len(photos) == 1:
@@ -336,13 +330,14 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE,
 
 
 # ---- Парсер /search ----
-
 def parse_search_args(args: list):
     include_groups = []
     exclude = []
     limit = 20
     lang = None
     media_type = None
+    since = None
+    until = None
 
     for raw in args:
         arg = raw.strip()
@@ -369,6 +364,12 @@ def parse_search_args(args: list):
             if t in mapping:
                 media_type = mapping[t]
             continue
+        if arg.startswith("since:"):
+            since = arg.split(":", 1)[1].strip()
+            continue
+        if arg.startswith("until:"):
+            until = arg.split(":", 1)[1].strip()
+            continue
         if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
             word = arg[1:].strip().lstrip("#")
             if word:
@@ -379,7 +380,7 @@ def parse_search_args(args: list):
         if g:
             include_groups.append(g)
 
-    return include_groups, exclude, limit, lang, media_type
+    return include_groups, exclude, limit, lang, media_type, since, until
 
 
 def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
@@ -422,7 +423,6 @@ def extract_chat_id_from_forward(message):
 
 
 # ---- Help ----
-
 def help_text(user_id: int) -> str:
     base = (
         "🤖 <b>X Scroller Bot</b>\n"
@@ -434,12 +434,15 @@ def help_text(user_id: int) -> str:
         "   📱 С телефона? Смотрите <b>/help_mobile</b>\n\n"
         "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> "
         "<code>[n-N]</code> <code>[lang:xx]</code> <code>[type:T]</code>\n"
+        "   <code>[since:ГГГГ-ММ-ДД]</code> <code>[until:ГГГГ-ММ-ДД]</code>\n"
         "   • <code>apple sun</code> → apple <b>ИЛИ</b> sun\n"
         "   • <code>apple,sun</code> → apple <b>И</b> sun\n"
         "   • <code>-nsfw</code> → исключить\n"
         "   • <code>n-10</code> → лимит (1–100)\n"
         "   • <code>lang:en</code> → язык\n"
-        "   • <code>type:photo|video|gif|text|any</code>\n\n"
+        "   • <code>type:photo|video|gif|text|any</code>\n"
+        "   • <code>since:2026-09-26</code> → начиная с даты\n"
+        "   • <code>until:2026-09-27</code> → до даты\n\n"
         "⏹ <b>/stop</b> — прервать свой поиск\n"
         "🗑 <b>/clear</b> — удалить свои сообщения бота\n"
         "♻️ <b>/dedup</b> <code>on|off</code> — вкл/выкл дедупликацию\n"
@@ -527,7 +530,6 @@ MOBILE_HELP_TEXT = (
 
 
 # ---- Handlers ----
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or ""
@@ -564,7 +566,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Инструкция по получению cookies с телефона."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     if not is_allowed(user_id):
@@ -957,13 +958,14 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         m = await update.message.reply_text(
             "❌ Укажите теги. Пример:\n"
-            "<code>/search arknights type:photo n-5 lang:en</code>",
+            "<code>/search arknights since:2026-09-26 type:photo n-5 lang:en</code>",
             parse_mode="HTML"
         )
         track_sent(chat_id, m)
         return
 
-    groups, exclude, limit, lang, media_type = parse_search_args(context.args)
+    (groups, exclude, limit, lang, media_type,
+     since, until) = parse_search_args(context.args)
 
     if not groups:
         m = await update.message.reply_text("❌ Не нашёл теги. Проверьте формат.")
@@ -981,6 +983,9 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🟢 вкл ({len(user.sent_tweets)} зап.)"
         if user.dedup_enabled else "🔴 выкл"
     )
+    date_info = ""
+    if since or until:
+        date_info = f"\n📅 <b>Даты:</b> {since or '…'} → {until or 'сейчас'}"
 
     header = (
         "🔍 <b>Поиск запущен</b>\n"
@@ -989,7 +994,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚫 <b>Исключить:</b> <code>{esc(exclude_display)}</code>\n"
         f"{media_type_icon(media_type)} <b>Тип:</b> <code>{media_type or 'any'}</code>\n"
         f"🌐 <b>Язык:</b> <code>{esc(lang or 'любой')}</code>\n"
-        f"📊 <b>Лимит:</b> <code>{limit}</code>\n"
+        f"📊 <b>Лимит:</b> <code>{limit}</code>{date_info}\n"
         f"📨 <b>Получатели:</b> {targets_info}\n"
         f"♻️ <b>Дед.:</b> {dedup_state}"
     )
@@ -997,13 +1002,15 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_sent(chat_id, msg)
 
     asyncio.create_task(
-        _do_search(user, chat_id, msg, context, groups, exclude, limit, lang, media_type)
+        _do_search(user, chat_id, msg, context, groups, exclude, limit, lang,
+                   media_type, since, until)
     )
 
 
 async def _do_search(user: UserState, chat_id: int, msg,
                      context: ContextTypes.DEFAULT_TYPE,
-                     groups, exclude, limit, lang, media_type):
+                     groups, exclude, limit, lang, media_type,
+                     since, until):
     try:
         group_strs = []
         for g in groups:
@@ -1017,6 +1024,10 @@ async def _do_search(user: UserState, chat_id: int, msg,
             parts.append("filter:images")
         if lang:
             parts.append(f"lang:{lang}")
+        if since:
+            parts.append(f"since:{since}")
+        if until:
+            parts.append(f"until:{until}")
 
         full_query = " ".join(parts)
         logger.info(f"[u{user.user_id}] query: {full_query} (limit={limit})")
@@ -1125,7 +1136,6 @@ async def _do_search(user: UserState, chat_id: int, msg,
 
 
 # ---- Веб-сервер ----
-
 async def health_check(request):
     return web.Response(text="Bot is alive!")
 
@@ -1142,7 +1152,6 @@ async def start_web_server():
 
 
 # ---- Запуск ----
-
 async def run_bot():
     application = (
         Application.builder()
