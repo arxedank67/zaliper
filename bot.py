@@ -43,10 +43,9 @@ if _raw_allowed:
     logger.info(f"Whitelist активен: {sorted(ALLOWED_USERS)}")
 
 MAX_USERS = 1000
-DEDUP_TTL = 3 * 60 * 60  # 3 часа
+DEDUP_TTL = 3 * 60 * 60
 MAX_TRACKED_PER_CHAT = 3000
 
-# Семафор — не более 2 одновременных поисков ко X (общая защита от rate-limit)
 SEARCH_SEMAPHORE = asyncio.Semaphore(2)
 
 http_session: aiohttp.ClientSession | None = None
@@ -63,7 +62,7 @@ HEADERS = {
 class UserState:
     user_id: int
     username: str = ""
-    x_api: API | None = None  # персональный API-инстанс (свой DB-файл)
+    x_api: API | None = None
     targets: list[int] = field(default_factory=list)
     dedup_enabled: bool = True
     sent_tweets: dict[int, float] = field(default_factory=dict)
@@ -98,7 +97,6 @@ def get_user(user_id: int, username: str = "") -> UserState:
 
 
 def get_x_api(user: UserState) -> API:
-    """Ленивая инициализация персонального API twscrape."""
     if user.x_api is None:
         user.x_api = API(str(user.db_path))
         logger.info(f"[u{user.user_id}] X API создан: {user.db_path}")
@@ -134,7 +132,7 @@ def track_sent(chat_id: int, *messages):
         SENT_MESSAGES[chat_id] = SENT_MESSAGES[chat_id][-MAX_TRACKED_PER_CHAT // 2:]
 
 
-# ---- Per-user dedup ----
+# ---- Dedup ----
 
 def is_sent(user: UserState, tweet_id: int) -> bool:
     if not user.dedup_enabled:
@@ -170,7 +168,6 @@ async def dedup_cleanup_loop():
 
 
 async def user_cleanup_loop():
-    """Раз в сутки удаляет неактивных пользователей без данных."""
     while True:
         await asyncio.sleep(24 * 60 * 60)
         now = time.time()
@@ -195,10 +192,8 @@ async def user_cleanup_loop():
 # ---- X account helpers ----
 
 async def add_x_account(user: UserState, auth_token: str, ct0: str) -> bool:
-    """Добавляет X-аккаунт в персональный пул пользователя."""
     try:
         api = get_x_api(user)
-        # username должен быть уникальным внутри БД пользователя
         acc_name = f"u{user.user_id}"
         await api.pool.add_account_cookies(
             acc_name,
@@ -213,7 +208,6 @@ async def add_x_account(user: UserState, auth_token: str, ct0: str) -> bool:
 
 async def user_has_active_x_account(user: UserState) -> bool:
     if user.x_api is None:
-        # Попробуем инициализировать, если есть файл
         if user.db_path.exists():
             get_x_api(user)
         else:
@@ -226,17 +220,14 @@ async def user_has_active_x_account(user: UserState) -> bool:
 
 
 async def ensure_owner_account():
-    """Восстанавливает X-аккаунт владельца из env (только для владельца)."""
     auth = os.environ.get("X_AUTH_TOKEN")
     ct0 = os.environ.get("X_CT0")
     if not (auth and ct0):
         return
-
     owner = get_user(OWNER_USER_ID, "owner")
     if await user_has_active_x_account(owner):
         logger.info("Owner X аккаунт уже есть в БД.")
         return
-
     logger.info("Восстанавливаю owner X аккаунт из env…")
     await add_x_account(owner, auth, ct0)
 
@@ -439,7 +430,8 @@ def help_text(user_id: int) -> str:
         "⚙️ <b>Первый запуск:</b>\n"
         "   <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code> —\n"
         "   добавьте свой X-аккаунт (cookies).\n"
-        "   <i>Без него поиск работать не будет.</i>\n\n"
+        "   <i>Без него поиск работать не будет.</i>\n"
+        "   📱 С телефона? Смотрите <b>/help_mobile</b>\n\n"
         "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> "
         "<code>[n-N]</code> <code>[lang:xx]</code> <code>[type:T]</code>\n"
         "   • <code>apple sun</code> → apple <b>ИЛИ</b> sun\n"
@@ -452,7 +444,8 @@ def help_text(user_id: int) -> str:
         "🗑 <b>/clear</b> — удалить свои сообщения бота\n"
         "♻️ <b>/dedup</b> <code>on|off</code> — вкл/выкл дедупликацию\n"
         "🧹 <b>/clear_dedup</b> — сбросить память дедупликации\n"
-        "📊 <b>/my_status</b> — статус вашего X-аккаунта\n\n"
+        "📊 <b>/my_status</b> — статус вашего X-аккаунта\n"
+        "📱 <b>/help_mobile</b> — как получить cookies с телефона\n\n"
         "📨 <b>Пересылка контактам</b>\n"
         "   • <b>/add_target</b> — ответом на пересланное\n"
         "     или <code>/add_target &lt;chat_id&gt;</code>\n"
@@ -488,8 +481,48 @@ X_ACCOUNT_HELP = (
     "   • <code>ct0</code>\n"
     "4. Отправьте боту:\n"
     "   <code>/add_account ВАШ_auth_token ВАШ_ct0</code>\n\n"
+    "📱 <b>С телефона?</b> Введите <b>/help_mobile</b> — там пошаговая инструкция.\n\n"
     "<i>⚠️ Cookies — это доступ к вашему аккаунту X. "
     "Используйте свой аккаунт, не чужой.</i>"
+)
+
+
+MOBILE_HELP_TEXT = (
+    "📱 <b>Как получить cookies X с телефона</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "<b>Способ 1 — Kiwi Browser (Android) ⭐ рекомендуем</b>\n\n"
+    "1️⃣ Установите <b>Kiwi Browser</b> из Google Play.\n"
+    "2️⃣ Откройте в нём Chrome Web Store и установите расширение\n"
+    "    <b>Cookie-Editor</b> (от Kenny Do).\n"
+    "3️⃣ Зайдите на <b>x.com</b> и войдите в свой аккаунт.\n"
+    "4️⃣ Нажмите на иконку <b>Cookie-Editor</b> в браузере.\n"
+    "5️⃣ Найдите в списке:\n"
+    "    • <code>auth_token</code> — скопируйте значение\n"
+    "    • <code>ct0</code> — скопируйте значение\n"
+    "6️⃣ Отправьте боту:\n"
+    "    <code>/add_account ВАШ_auth_token ВАШ_ct0</code>\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "<b>Способ 2 — Orion Browser (iOS)</b>\n\n"
+    "1️⃣ Установите <b>Orion Browser</b> из App Store.\n"
+    "2️⃣ Установите расширение <b>Cookie-Editor</b>\n"
+    "    (Orion поддерживает расширения Chrome/Safari).\n"
+    "3️⃣ Войдите в <b>x.com</b> прямо в Orion.\n"
+    "4️⃣ Откройте Cookie-Editor и скопируйте\n"
+    "    значения <code>auth_token</code> и <code>ct0</code>.\n"
+    "5️⃣ Отправьте боту <code>/add_account</code> с этими значениями.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "<b>Способ 3 — через ПК (если есть доступ)</b>\n\n"
+    "1️⃣ Откройте x.com на компьютере (в браузере где залогинены).\n"
+    "2️⃣ F12 → <b>Application</b> → <b>Cookies</b> → <code>https://x.com</code>\n"
+    "3️⃣ Скопируйте <code>auth_token</code> и <code>ct0</code>.\n"
+    "4️⃣ Перешлите их боту (можно с любого устройства).\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "⚠️ <b>Важно:</b>\n"
+    "• <code>auth_token</code> — длинная строка (~40 символов)\n"
+    "• <code>ct0</code> — длинная строка (~160 символов)\n"
+    "• Копируйте <b>только значение</b>, без имени ключа\n"
+    "• Бот сам удалит ваше сообщение с cookies\n\n"
+    "❓ Не получилось? Попросите владельца бота помочь."
 )
 
 
@@ -530,6 +563,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_sent(chat_id, m)
 
 
+async def help_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Инструкция по получению cookies с телефона."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id):
+        m = await update.message.reply_text("⛔ Доступ ограничен.")
+        track_sent(chat_id, m)
+        return
+    m = await update.message.reply_text(MOBILE_HELP_TEXT, parse_mode="HTML")
+    track_sent(chat_id, m)
+
+
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "—"
@@ -543,7 +588,6 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Каждый пользователь добавляет СВОЙ X-аккаунт."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     if not is_allowed(user_id):
@@ -558,9 +602,8 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ <b>Использование:</b>\n"
             "<code>/add_account &lt;auth_token&gt; &lt;ct0&gt;</code>\n\n"
             "<b>Как получить cookies:</b>\n"
-            "1. Откройте x.com в браузере (залогинившись).\n"
-            "2. F12 → Application → Cookies → https://x.com\n"
-            "3. Скопируйте значения <code>auth_token</code> и <code>ct0</code>",
+            "• 📱 С телефона → <b>/help_mobile</b>\n"
+            "• 💻 С ПК → F12 → Application → Cookies → x.com",
             parse_mode="HTML"
         )
         track_sent(chat_id, m)
@@ -568,7 +611,6 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     auth_token, ct0 = context.args[0], context.args[1]
 
-    # Удалим сообщение с токенами ради безопасности
     try:
         await update.message.delete()
     except Exception:
@@ -581,7 +623,6 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Не удалось добавить X-аккаунт. Проверьте логи.")
         return
 
-    # Проверяем активность — сделаем тестовый поиск
     try:
         api = get_x_api(user)
         accounts = await api.pool.accounts_info()
@@ -603,7 +644,6 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Личный статус пользователя."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     if not is_allowed(user_id):
@@ -624,6 +664,7 @@ async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("👤 <b>X-аккаунт:</b> ❌ не добавлен")
         lines.append("   <i>Используйте /add_account</i>")
+        lines.append("   <i>📱 с телефона → /help_mobile</i>")
 
     lines.append("")
     lines.append(f"🔍 Поисков всего: <b>{user.total_searches}</b>")
@@ -637,7 +678,6 @@ async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальная статистика (только владелец)."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     if not is_owner(user_id):
@@ -650,11 +690,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_posts = sum(u.total_posts for u in USER_DATA.values())
     total_searches = sum(u.total_searches for u in USER_DATA.values())
 
-    # Считаем, у кого есть свой X-аккаунт
-    with_x = 0
-    for u in USER_DATA.values():
-        if u.db_path.exists():
-            with_x += 1
+    with_x = sum(1 for u in USER_DATA.values() if u.db_path.exists())
 
     lines = [
         "📊 <b>Глобальная статистика</b>",
@@ -908,7 +944,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = get_user(user_id, update.effective_user.username or "")
 
-    # Проверка: есть ли у пользователя свой X-аккаунт
     if not await user_has_active_x_account(user):
         m = await update.message.reply_text(X_ACCOUNT_HELP, parse_mode="HTML")
         track_sent(chat_id, m)
@@ -988,7 +1023,6 @@ async def _do_search(user: UserState, chat_id: int, msg,
 
         fetch_limit = min(limit * 3 + len(exclude) * 5, 100)
 
-        # Используем ПЕРСОНАЛЬНЫЙ API пользователя
         api = get_x_api(user)
         async with SEARCH_SEMAPHORE:
             tweets = await gather(api.search(full_query, limit=fetch_limit))
@@ -1119,6 +1153,7 @@ async def run_bot():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("help_mobile", help_mobile))
     application.add_handler(CommandHandler("my_id", my_id))
     application.add_handler(CommandHandler("my_status", my_status))
     application.add_handler(CommandHandler("add_account", add_account))
