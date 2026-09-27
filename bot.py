@@ -157,9 +157,20 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
     return len(photos_to_send)
 
 
-def parse_search_args(args: list) -> tuple[list, int, str | None]:
-    """Разбирает аргументы /search."""
+def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
+    """Разбирает аргументы /search.
+
+    Поддерживает:
+      /search Arknights                          → tags, exclude=[], limit=20, lang=None
+      /search Arknights n-10                     → limit=10
+      /search Arknights -footfetish              → exclude=["footfetish"]
+      /search Arknights -footfetish -guro n-5    → два исключения, limit=5
+      /search Arknights lang:en                  → lang="en"
+
+    Возвращает: (tags, exclude, limit, lang)
+    """
     tags = []
+    exclude = []
     limit = 20
     lang = None
 
@@ -168,10 +179,12 @@ def parse_search_args(args: list) -> tuple[list, int, str | None]:
         if not arg:
             continue
 
+        # n-<число>
         if arg.startswith("n-") and arg[2:].isdigit():
             limit = max(1, min(100, int(arg[2:])))
             continue
 
+        # lang:xx или lang-xx
         if arg.startswith("lang:") or arg.startswith("lang-"):
             code = arg.split(":", 1)[1] if ":" in arg else arg.split("-", 1)[1]
             code = code.strip().lower()
@@ -179,9 +192,28 @@ def parse_search_args(args: list) -> tuple[list, int, str | None]:
                 lang = code
             continue
 
+        # Исключения: -тег (одинарный минус, но не "--")
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            word = arg[1:].strip().lstrip("#")
+            if word:
+                exclude.append(word)
+            continue
+
         tags.append(arg)
 
-    return tags, limit, lang
+    return tags, exclude, limit, lang
+
+
+def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
+    """Проверяет, содержит ли пост исключаемые слова (клиентский fallback)."""
+    if not exclude:
+        return False
+    text = (tweet.rawContent or "").lower()
+    for word in exclude:
+        w = word.lower().lstrip("#")
+        if w and w in text:
+            return True
+    return False
 
 
 # --- Обработчики команд Telegram ---
@@ -190,13 +222,14 @@ HELP_TEXT = (
     "🤖 <b>X Scroller Bot</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n\n"
     "📌 <b>Команды</b>\n\n"
-    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[n-N]</code> <code>[lang:xx]</code>\n"
+    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> <code>[n-N]</code> <code>[lang:xx]</code>\n"
     "   Поиск постов с картинками\n"
     "   <i>Примеры:</i>\n"
     "   • <code>/search Arknights</code>\n"
     "   • <code>/search Arknights n-10</code>\n"
     "   • <code>/search Arknights n-10 lang:en</code>\n"
-    "   • <code>/search Zone-tan, Paimon n-5</code>\n\n"
+    "   • <code>/search arknights -footfetish n-5 lang:en</code>\n"
+    "   • <code>/search Zone-tan, Paimon -guro n-5</code>\n\n"
     "⏹ <b>/stop</b> — прервать текущий поиск\n"
     "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code> — добавить аккаунт X\n"
     "📊 <b>/status</b> — статус аккаунтов X\n"
@@ -205,6 +238,7 @@ HELP_TEXT = (
     "💡 <i>Параметры поиска:</i>\n"
     "• <code>n-N</code> — сколько постов искать (1–100)\n"
     "• <code>lang:xx</code> — язык постов (en, ru, ja, ko…)\n"
+    "• <code>-тег</code> — исключить посты с этим словом\n"
 )
 
 
@@ -290,36 +324,38 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Укажите теги.\n"
-            "<b>Пример:</b> <code>/search Arknights n-10 lang:en</code>",
+            "<b>Пример:</b> <code>/search arknights -footfetish n-5 lang:en</code>",
             parse_mode="HTML"
         )
         return
 
-    tags, limit, lang = parse_search_args(context.args)
+    tags, exclude, limit, lang = parse_search_args(context.args)
 
     if not tags:
         await update.message.reply_text(
             "❌ Не нашёл теги. Проверьте формат:\n"
-            "<code>/search &lt;теги&gt; [n-N] [lang:xx]</code>",
+            "<code>/search &lt;теги&gt; [-искл] [n-N] [lang:xx]</code>",
             parse_mode="HTML"
         )
         return
 
     lang_display = lang if lang else "любой"
+    exclude_display = ", ".join(exclude) if exclude else "—"
+
     header = (
         "🔍 <b>Поиск запущен</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 <b>Теги:</b> <code>{esc(', '.join(tags))}</code>\n"
+        f"🚫 <b>Исключить:</b> <code>{esc(exclude_display)}</code>\n"
         f"🌐 <b>Язык:</b> <code>{esc(lang_display)}</code>\n"
         f"📊 <b>Лимит:</b> <code>{limit}</code>"
     )
     msg = await update.message.reply_text(header, parse_mode="HTML")
 
-    # Запускаем в фоне, чтобы /stop мог сработать
-    asyncio.create_task(_do_search(msg, context, tags, limit, lang))
+    asyncio.create_task(_do_search(msg, context, tags, exclude, limit, lang))
 
 
-async def _do_search(msg, context, tags, limit, lang):
+async def _do_search(msg, context, tags, exclude, limit, lang):
     """Фоновый поиск и скачивание."""
     global _search_active
 
@@ -327,17 +363,34 @@ async def _do_search(msg, context, tags, limit, lang):
     _search_active = True
 
     try:
-        query = " OR ".join(tags)
-        full_query = f"({query}) filter:images"
+        # Формируем запрос: (tag1 OR tag2) -exclude1 -exclude2 filter:images [lang:xx]
+        include_part = " OR ".join(tags)
+        query_parts = [f"({include_part})"]
+
+        for word in exclude:
+            # Twitter-совместимый минус-оператор
+            query_parts.append(f"-{word}")
+
+        query_parts.append("filter:images")
         if lang:
-            full_query += f" lang:{lang}"
+            query_parts.append(f"lang:{lang}")
 
+        full_query = " ".join(query_parts)
         logger.info(f"Ищу: {full_query} (limit={limit})")
-        tweets = await gather(api.search(full_query, limit=limit))
 
-        # ФИКС: twscrape может вернуть больше, чем просили — режем вручную
+        # Чуть больше запрашиваем, чтобы после фильтрации осталось нужное количество
+        fetch_limit = min(limit + len(exclude) * 5, 100)
+
+        tweets = await gather(api.search(full_query, limit=fetch_limit))
+
+        # Клиентский фильтр на всякий случай (Twitter иногда игнорирует -слово)
+        if exclude:
+            before = len(tweets)
+            tweets = [t for t in tweets if not tweet_has_excluded(t, exclude)]
+            logger.info(f"Клиентский фильтр исключений: {before} → {len(tweets)}")
+
+        # Обрезаем до запрошенного лимита
         if len(tweets) > limit:
-            logger.info(f"twscrape вернул {len(tweets)}, обрезаю до {limit}")
             tweets = tweets[:limit]
 
         if not tweets:
@@ -449,7 +502,7 @@ async def run_bot():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)  # ← ФИКС: разрешаем параллельную обработку команд
+        .concurrent_updates(True)
         .build()
     )
 
@@ -464,7 +517,6 @@ async def run_bot():
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-    # Проверим/восстановим аккаунт X
     await ensure_account()
 
     logger.info("Telegram-бот запущен.")
