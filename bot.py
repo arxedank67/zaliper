@@ -29,8 +29,9 @@ logger = logging.getLogger(__name__)
 # --- Инициализация API twscrape ---
 api = API("accounts.db")
 
-# Глобальный флаг остановки поиска
+# Флаги для управления поиском
 stop_event = asyncio.Event()
+_search_active = False
 
 # Общая aiohttp-сессия
 http_session: aiohttp.ClientSession | None = None
@@ -43,7 +44,6 @@ HEADERS = {
 
 
 def esc(s: str) -> str:
-    """Экранирует спецсимволы HTML в пользовательском тексте."""
     return html.escape(s or "")
 
 
@@ -61,6 +61,28 @@ async def add_twitter_account(auth_token: str, ct0: str):
     except Exception as e:
         logger.error(f"Ошибка добавления аккаунта: {e}")
         return False
+
+
+async def ensure_account():
+    """Проверяет, есть ли аккаунт X. Если нет — восстанавливает из env."""
+    try:
+        accounts = await api.pool.accounts_info()
+        if accounts and any(acc.get("active") for acc in accounts):
+            logger.info(f"Активных аккаунтов X: {len(accounts)}")
+            return
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать пул аккаунтов: {e}")
+
+    auth = os.environ.get("X_AUTH_TOKEN")
+    ct0 = os.environ.get("X_CT0")
+    if auth and ct0:
+        logger.info("Аккаунт не найден, восстанавливаю из переменных окружения…")
+        await add_twitter_account(auth, ct0)
+    else:
+        logger.warning(
+            "Аккаунт X не найден. Добавьте через /add_account "
+            "или задайте X_AUTH_TOKEN + X_CT0 в переменных окружения Render."
+        )
 
 
 async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE):
@@ -135,19 +157,8 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
     return len(photos_to_send)
 
 
-# --- Парсер аргументов поиска ---
-
 def parse_search_args(args: list) -> tuple[list, int, str | None]:
-    """Разбирает аргументы /search.
-
-    Поддерживает:
-      /search Arknights                       → tags, limit=20, lang=None
-      /search Arknights n-10                  → tags, limit=10
-      /search Arknights lang:en               → tags, lang="en"
-      /search Arknights n-15 lang:ru          → tags, limit=15, lang="ru"
-
-    Возвращает: (tags, limit, lang)
-    """
+    """Разбирает аргументы /search."""
     tags = []
     limit = 20
     lang = None
@@ -157,12 +168,10 @@ def parse_search_args(args: list) -> tuple[list, int, str | None]:
         if not arg:
             continue
 
-        # n-<число>
         if arg.startswith("n-") and arg[2:].isdigit():
             limit = max(1, min(100, int(arg[2:])))
             continue
 
-        # lang:xx или lang-xx
         if arg.startswith("lang:") or arg.startswith("lang-"):
             code = arg.split(":", 1)[1] if ":" in arg else arg.split("-", 1)[1]
             code = code.strip().lower()
@@ -200,7 +209,6 @@ HELP_TEXT = (
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
     if update.effective_user.id != ALLOWED_USER_ID:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
@@ -208,14 +216,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает справку."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
     await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 
 async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавление аккаунта X по cookies."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
@@ -242,7 +248,6 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка статуса аккаунтов."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
@@ -266,29 +271,20 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
-    if not stop_event.is_set():
-        # Проверим, идёт ли вообще поиск
-        if stop_event._value is False and _search_in_progress():
-            stop_event.set()
-            await update.message.reply_text("⏹ Останавливаю поиск…")
-        else:
-            await update.message.reply_text("🤷 Сейчас нечего останавливать.")
+    if _search_active:
+        stop_event.set()
+        await update.message.reply_text("⏹ Останавливаю поиск…")
     else:
-        await update.message.reply_text("⏹ Уже останавливаю.")
-
-
-# Простой флаг, чтобы понимать, идёт ли поиск
-_search_active = False
-
-def _search_in_progress() -> bool:
-    return _search_active
+        await update.message.reply_text("🤷 Сейчас нечего останавливать.")
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск постов по тегам."""
-    global _search_active
-
+    """Обработчик /search — запускает поиск в фоне."""
     if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    if _search_active:
+        await update.message.reply_text("⚠️ Поиск уже идёт. Дождитесь или /stop.")
         return
 
     if not context.args:
@@ -309,15 +305,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Сбрасываем флаг остановки
-    stop_event.clear()
-    _search_active = True
-
-    query = " OR ".join(tags)
-    full_query = f"({query}) filter:images"
-    if lang:
-        full_query += f" lang:{lang}"
-
     lang_display = lang if lang else "любой"
     header = (
         "🔍 <b>Поиск запущен</b>\n"
@@ -328,14 +315,36 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     msg = await update.message.reply_text(header, parse_mode="HTML")
 
+    # Запускаем в фоне, чтобы /stop мог сработать
+    asyncio.create_task(_do_search(msg, context, tags, limit, lang))
+
+
+async def _do_search(msg, context, tags, limit, lang):
+    """Фоновый поиск и скачивание."""
+    global _search_active
+
+    stop_event.clear()
+    _search_active = True
+
     try:
+        query = " OR ".join(tags)
+        full_query = f"({query}) filter:images"
+        if lang:
+            full_query += f" lang:{lang}"
+
+        logger.info(f"Ищу: {full_query} (limit={limit})")
         tweets = await gather(api.search(full_query, limit=limit))
+
+        # ФИКС: twscrape может вернуть больше, чем просили — режем вручную
+        if len(tweets) > limit:
+            logger.info(f"twscrape вернул {len(tweets)}, обрезаю до {limit}")
+            tweets = tweets[:limit]
 
         if not tweets:
             await msg.edit_text("😕 Ничего не найдено по этим тегам.")
             return
 
-        # Клиентская фильтрация по языку (на случай, если Twitter вернул не то)
+        # Клиентская фильтрация по языку
         if lang:
             filtered = []
             for t in tweets:
@@ -365,7 +374,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stopped = False
 
         for tweet in tweets:
-            # Проверяем /stop перед каждым постом
             if stop_event.is_set():
                 stopped = True
                 break
@@ -374,7 +382,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_photos += count
             processed += 1
 
-            # Обновляем прогресс каждые 5 постов
             if processed % 5 == 0 and processed < total:
                 try:
                     await msg.edit_text(
@@ -384,11 +391,10 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML"
                     )
                 except Exception:
-                    pass  # Telegram иногда ругается на слишком частые edit
+                    pass
 
             await asyncio.sleep(1.5)
 
-        # Финальное сообщение
         if stopped:
             await msg.edit_text(
                 "⏹ <b>Остановлено пользователем</b>\n"
@@ -408,7 +414,13 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Ошибка поиска: {e}")
-        await msg.edit_text(f"❌ Ошибка: <code>{esc(str(e)[:200])}</code>", parse_mode="HTML")
+        try:
+            await msg.edit_text(
+                f"❌ Ошибка: <code>{esc(str(e)[:200])}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
     finally:
         _search_active = False
         stop_event.clear()
@@ -417,12 +429,10 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Веб-сервер для Render ---
 
 async def health_check(request):
-    """Отвечает 'OK' на пинги Render и UptimeRobot."""
     return web.Response(text="Bot is alive!")
 
 
 async def start_web_server():
-    """Запускает мини-сервер на порту, который требует Render."""
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
@@ -436,8 +446,12 @@ async def start_web_server():
 # --- Запуск бота ---
 
 async def run_bot():
-    """Запускает Telegram-бота в режиме polling в текущем event loop."""
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)  # ← ФИКС: разрешаем параллельную обработку команд
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -450,6 +464,9 @@ async def run_bot():
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
+    # Проверим/восстановим аккаунт X
+    await ensure_account()
+
     logger.info("Telegram-бот запущен.")
 
     try:
@@ -461,7 +478,6 @@ async def run_bot():
 
 
 async def main_async():
-    """Запускает и веб-сервер, и бота одновременно."""
     global http_session
     http_session = aiohttp.ClientSession()
 
