@@ -160,26 +160,34 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
 def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
     """Разбирает аргументы /search.
 
-    Поддерживает:
-      /search Arknights                          → tags, exclude=[], limit=20, lang=None
-      /search Arknights n-10                     → limit=10
-      /search Arknights -footfetish              → exclude=["footfetish"]
-      /search Arknights -footfetish -guro n-5    → два исключения, limit=5
-      /search Arknights lang:en                  → lang="en"
+    Логика групп:
+      - Теги через ЗАПЯТУЮ (apple,sun) — AND: все слова должны быть в посте.
+      - Разные аргументы через ПРОБЕЛ (apple sun) — OR: достаточно одного.
+      - Слова с минусом (-nsfw) — исключение.
 
-    Возвращает: (tags, exclude, limit, lang)
+    Примеры:
+      /search apple,sun
+        → groups=[["apple", "sun"]] → запрос: (apple sun)
+
+      /search apple,sun banana
+        → groups=[["apple", "sun"], ["banana"]]
+        → запрос: ((apple sun) OR banana)
+
+      /search apple,sun banana,moon n-5 lang:en
+        → groups=[["apple", "sun"], ["banana", "moon"]]
+        → запрос: ((apple sun) OR (banana moon)) filter:images lang:en
     """
-    tags = []
+    include_groups = []  # список групп; OR между группами, AND внутри
     exclude = []
     limit = 20
     lang = None
 
     for raw in args:
-        arg = raw.strip().rstrip(",")
+        arg = raw.strip()
         if not arg:
             continue
 
-        # n-<число>
+        # n-N
         if arg.startswith("n-") and arg[2:].isdigit():
             limit = max(1, min(100, int(arg[2:])))
             continue
@@ -192,20 +200,24 @@ def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
                 lang = code
             continue
 
-        # Исключения: -тег (одинарный минус, но не "--")
+        # Исключения: -тег
         if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
             word = arg[1:].strip().lstrip("#")
             if word:
                 exclude.append(word)
             continue
 
-        tags.append(arg)
+        # Обычные теги. Разбиваем по запятым → группа AND
+        parts = [p.strip().lstrip("#") for p in arg.split(",")]
+        group = [p for p in parts if p]
+        if group:
+            include_groups.append(group)
 
-    return tags, exclude, limit, lang
+    return include_groups, exclude, limit, lang
 
 
 def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
-    """Проверяет, содержит ли пост исключаемые слова (клиентский fallback)."""
+    """Клиентская страховка: проверяет исключаемые слова."""
     if not exclude:
         return False
     text = (tweet.rawContent or "").lower()
@@ -216,20 +228,33 @@ def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
     return False
 
 
+def format_groups_for_display(groups: list) -> str:
+    """Красиво показывает группы: apple + sun | banana."""
+    parts = []
+    for g in groups:
+        if len(g) == 1:
+            parts.append(g[0])
+        else:
+            parts.append(" + ".join(g))
+    return "  |  ".join(parts)
+
+
 # --- Обработчики команд Telegram ---
 
 HELP_TEXT = (
     "🤖 <b>X Scroller Bot</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n\n"
     "📌 <b>Команды</b>\n\n"
-    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> <code>[n-N]</code> <code>[lang:xx]</code>\n"
-    "   Поиск постов с картинками\n"
+    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> <code>[n-N]</code> <code>[lang:xx]</code>\n\n"
+    "   <b>Логика тегов:</b>\n"
+    "   • <code>apple sun</code> → apple <b>ИЛИ</b> sun\n"
+    "   • <code>apple,sun</code> → apple <b>И</b> sun (в одном посте)\n"
+    "   • <code>-nsfw</code> → исключить посты со словом nsfw\n\n"
     "   <i>Примеры:</i>\n"
-    "   • <code>/search Arknights</code>\n"
-    "   • <code>/search Arknights n-10</code>\n"
-    "   • <code>/search Arknights n-10 lang:en</code>\n"
-    "   • <code>/search arknights -footfetish n-5 lang:en</code>\n"
-    "   • <code>/search Zone-tan, Paimon -guro n-5</code>\n\n"
+    "   • <code>/search arknights n-10</code>\n"
+    "   • <code>/search arknights,nsfw n-5</code>\n"
+    "   • <code>/search arknights,nsfw -guro n-5 lang:en</code>\n"
+    "   • <code>/search apple,sun banana,moon n-10</code>\n\n"
     "⏹ <b>/stop</b> — прервать текущий поиск\n"
     "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code> — добавить аккаунт X\n"
     "📊 <b>/status</b> — статус аккаунтов X\n"
@@ -239,6 +264,8 @@ HELP_TEXT = (
     "• <code>n-N</code> — сколько постов искать (1–100)\n"
     "• <code>lang:xx</code> — язык постов (en, ru, ja, ko…)\n"
     "• <code>-тег</code> — исключить посты с этим словом\n"
+    "• <code>a,b</code> — AND: оба слова в посте\n"
+    "• <code>a b</code> — OR: любое из слов\n"
 )
 
 
@@ -324,14 +351,14 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Укажите теги.\n"
-            "<b>Пример:</b> <code>/search arknights -footfetish n-5 lang:en</code>",
+            "<b>Пример:</b> <code>/search arknights,nsfw -guro n-5 lang:en</code>",
             parse_mode="HTML"
         )
         return
 
-    tags, exclude, limit, lang = parse_search_args(context.args)
+    groups, exclude, limit, lang = parse_search_args(context.args)
 
-    if not tags:
+    if not groups:
         await update.message.reply_text(
             "❌ Не нашёл теги. Проверьте формат:\n"
             "<code>/search &lt;теги&gt; [-искл] [n-N] [lang:xx]</code>",
@@ -341,21 +368,22 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lang_display = lang if lang else "любой"
     exclude_display = ", ".join(exclude) if exclude else "—"
+    tags_display = format_groups_for_display(groups)
 
     header = (
         "🔍 <b>Поиск запущен</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📝 <b>Теги:</b> <code>{esc(', '.join(tags))}</code>\n"
+        f"📝 <b>Теги:</b> <code>{esc(tags_display)}</code>\n"
         f"🚫 <b>Исключить:</b> <code>{esc(exclude_display)}</code>\n"
         f"🌐 <b>Язык:</b> <code>{esc(lang_display)}</code>\n"
         f"📊 <b>Лимит:</b> <code>{limit}</code>"
     )
     msg = await update.message.reply_text(header, parse_mode="HTML")
 
-    asyncio.create_task(_do_search(msg, context, tags, exclude, limit, lang))
+    asyncio.create_task(_do_search(msg, context, groups, exclude, limit, lang))
 
 
-async def _do_search(msg, context, tags, exclude, limit, lang):
+async def _do_search(msg, context, groups, exclude, limit, lang):
     """Фоновый поиск и скачивание."""
     global _search_active
 
@@ -363,14 +391,20 @@ async def _do_search(msg, context, tags, exclude, limit, lang):
     _search_active = True
 
     try:
-        # Формируем запрос: (tag1 OR tag2) -exclude1 -exclude2 filter:images [lang:xx]
-        include_part = " OR ".join(tags)
+        # Формируем запрос:
+        #   группы через OR, слова внутри группы — через пробел (AND)
+        group_strs = []
+        for g in groups:
+            if len(g) == 1:
+                group_strs.append(g[0])
+            else:
+                group_strs.append("(" + " ".join(g) + ")")
+
+        include_part = " OR ".join(group_strs)
+
         query_parts = [f"({include_part})"]
-
         for word in exclude:
-            # Twitter-совместимый минус-оператор
             query_parts.append(f"-{word}")
-
         query_parts.append("filter:images")
         if lang:
             query_parts.append(f"lang:{lang}")
@@ -378,12 +412,12 @@ async def _do_search(msg, context, tags, exclude, limit, lang):
         full_query = " ".join(query_parts)
         logger.info(f"Ищу: {full_query} (limit={limit})")
 
-        # Чуть больше запрашиваем, чтобы после фильтрации осталось нужное количество
+        # Компенсируем возможную потерю после клиентских фильтров
         fetch_limit = min(limit + len(exclude) * 5, 100)
 
         tweets = await gather(api.search(full_query, limit=fetch_limit))
 
-        # Клиентский фильтр на всякий случай (Twitter иногда игнорирует -слово)
+        # Клиентский фильтр исключений
         if exclude:
             before = len(tweets)
             tweets = [t for t in tweets if not tweet_has_excluded(t, exclude)]
