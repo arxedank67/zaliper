@@ -3,6 +3,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
@@ -26,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 # --- Инициализация API twscrape ---
 api = API("accounts.db")
+
+# Общая aiohttp-сессия для скачивания картинок
+http_session: aiohttp.ClientSession | None = None
 
 # User-Agent, чтобы Twitter не блокировал скачивание картинок с Render
 HEADERS = {
@@ -81,7 +85,8 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
         file_path = TEMP_DIR / f"{tweet.id}_{i}.jpg"
 
         try:
-            async with context.bot.session.get(url, headers=HEADERS) as resp:
+            # Используем собственную aiohttp-сессию, а не bot.session
+            async with http_session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
                     with open(file_path, "wb") as f:
                         f.write(await resp.read())
@@ -189,7 +194,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "📊 **Статус аккаунтов:**\n"
     for acc in accounts:
-        text += f"• `{acc.username}` — {'✅ активен' if acc.active else '❌ неактивен'}\n"
+        # accounts_info возвращает список словарей, а не объектов
+        username = acc.get("username", "unknown")
+        is_active = acc.get("active", False)
+        text += f"• `{username}` — {'✅ активен' if is_active else '❌ неактивен'}\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -276,14 +284,12 @@ async def run_bot():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
 
-    # Ручная инициализация — не создаёт свой event loop
     await application.initialize()
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
     logger.info("Telegram-бот запущен.")
 
-    # Держим бота запущенным, пока процесс не остановят
     try:
         await asyncio.Event().wait()
     finally:
@@ -294,10 +300,16 @@ async def run_bot():
 
 async def main_async():
     """Запускает и веб-сервер, и бота одновременно."""
-    await asyncio.gather(
-        start_web_server(),
-        run_bot()
-    )
+    global http_session
+    http_session = aiohttp.ClientSession()
+
+    try:
+        await asyncio.gather(
+            start_web_server(),
+            run_bot()
+        )
+    finally:
+        await http_session.close()
 
 
 if __name__ == "__main__":
