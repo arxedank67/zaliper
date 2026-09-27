@@ -267,7 +267,7 @@ async def start_web_server():
 # --- Запуск бота ---
 
 async def run_bot():
-    """Запускает Telegram-бота в режиме polling."""
+    """Запускает Telegram-бота в режиме polling в текущем event loop."""
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -276,8 +276,20 @@ async def run_bot():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
 
+    # Ручная инициализация — не создаёт свой event loop
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
     logger.info("Telegram-бот запущен.")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Держим бота запущенным, пока процесс не остановят
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 
 async def main_async():
