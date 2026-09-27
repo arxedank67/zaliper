@@ -33,6 +33,9 @@ api = API("accounts.db")
 stop_event = asyncio.Event()
 _search_active = False
 
+# Дополнительные получатели (кроме владельца)
+EXTRA_TARGETS: list[int] = []
+
 # Общая aiohttp-сессия
 http_session: aiohttp.ClientSession | None = None
 
@@ -45,6 +48,21 @@ HEADERS = {
 
 def esc(s: str) -> str:
     return html.escape(s or "")
+
+
+def load_targets_from_env():
+    """Загружает дополнительные chat_id из переменной окружения TARGET_CHAT_IDS."""
+    raw = os.environ.get("TARGET_CHAT_IDS", "").strip()
+    if not raw:
+        return
+    for part in raw.split(","):
+        p = part.strip()
+        if p.lstrip("-").isdigit():
+            cid = int(p)
+            if cid != ALLOWED_USER_ID and cid not in EXTRA_TARGETS:
+                EXTRA_TARGETS.append(cid)
+    if EXTRA_TARGETS:
+        logger.info(f"Загружено получателей из env: {EXTRA_TARGETS}")
 
 
 # --- Вспомогательные функции ---
@@ -85,8 +103,32 @@ async def ensure_account():
         )
 
 
+async def send_tweet_to(chat_id: int, photos_to_send: list, caption: str,
+                        context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет один пост одному получателю."""
+    if len(photos_to_send) == 1:
+        with open(photos_to_send[0], "rb") as f:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=f,
+                caption=caption,
+                parse_mode="HTML"
+            )
+    else:
+        media_group = []
+        for path in photos_to_send:
+            with open(path, "rb") as f:
+                media_group.append(InputMediaPhoto(media=f))
+        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode="HTML"
+        )
+
+
 async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE):
-    """Скачивает все картинки из твита и отправляет их в Telegram."""
+    """Скачивает все картинки из твита и рассылает их владельцу и доп. получателям."""
     media_list = tweet.media
     if not media_list:
         return 0
@@ -126,30 +168,17 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
         f'📝 <i>{text_preview}</i>'
     )
 
+    recipients = [ALLOWED_USER_ID] + EXTRA_TARGETS
+
     try:
-        if len(photos_to_send) == 1:
-            with open(photos_to_send[0], "rb") as f:
-                await context.bot.send_photo(
-                    chat_id=ALLOWED_USER_ID,
-                    photo=f,
-                    caption=caption,
-                    parse_mode="HTML"
-                )
-        else:
-            media_group = []
-            for path in photos_to_send:
-                with open(path, "rb") as f:
-                    media_group.append(InputMediaPhoto(media=f))
-            await context.bot.send_media_group(
-                chat_id=ALLOWED_USER_ID, media=media_group
-            )
-            await context.bot.send_message(
-                chat_id=ALLOWED_USER_ID,
-                text=caption,
-                parse_mode="HTML"
-            )
-    except Exception as e:
-        logger.error(f"Ошибка отправки в Telegram: {e}")
+        for chat_id in recipients:
+            try:
+                await send_tweet_to(chat_id, photos_to_send, caption, context)
+                # Небольшая пауза между получателями, чтобы не ловить rate limit
+                if len(recipients) > 1:
+                    await asyncio.sleep(0.7)
+            except Exception as e:
+                logger.error(f"Ошибка отправки в {chat_id}: {e}")
     finally:
         for path in photos_to_send:
             path.unlink(missing_ok=True)
@@ -164,20 +193,8 @@ def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
       - Теги через ЗАПЯТУЮ (apple,sun) — AND: все слова должны быть в посте.
       - Разные аргументы через ПРОБЕЛ (apple sun) — OR: достаточно одного.
       - Слова с минусом (-nsfw) — исключение.
-
-    Примеры:
-      /search apple,sun
-        → groups=[["apple", "sun"]] → запрос: (apple sun)
-
-      /search apple,sun banana
-        → groups=[["apple", "sun"], ["banana"]]
-        → запрос: ((apple sun) OR banana)
-
-      /search apple,sun banana,moon n-5 lang:en
-        → groups=[["apple", "sun"], ["banana", "moon"]]
-        → запрос: ((apple sun) OR (banana moon)) filter:images lang:en
     """
-    include_groups = []  # список групп; OR между группами, AND внутри
+    include_groups = []
     exclude = []
     limit = 20
     lang = None
@@ -187,12 +204,10 @@ def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
         if not arg:
             continue
 
-        # n-N
         if arg.startswith("n-") and arg[2:].isdigit():
             limit = max(1, min(100, int(arg[2:])))
             continue
 
-        # lang:xx или lang-xx
         if arg.startswith("lang:") or arg.startswith("lang-"):
             code = arg.split(":", 1)[1] if ":" in arg else arg.split("-", 1)[1]
             code = code.strip().lower()
@@ -200,14 +215,12 @@ def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
                 lang = code
             continue
 
-        # Исключения: -тег
         if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
             word = arg[1:].strip().lstrip("#")
             if word:
                 exclude.append(word)
             continue
 
-        # Обычные теги. Разбиваем по запятым → группа AND
         parts = [p.strip().lstrip("#") for p in arg.split(",")]
         group = [p for p in parts if p]
         if group:
@@ -239,6 +252,30 @@ def format_groups_for_display(groups: list) -> str:
     return "  |  ".join(parts)
 
 
+def extract_chat_id_from_forward(message) -> int | None:
+    """Извлекает chat_id из пересланного сообщения."""
+    origin = getattr(message, "forward_origin", None)
+    if not origin:
+        return None
+
+    # MessageOriginUser
+    sender_user = getattr(origin, "sender_user", None)
+    if sender_user:
+        return sender_user.id
+
+    # MessageOriginChat
+    sender_chat = getattr(origin, "sender_chat", None)
+    if sender_chat:
+        return sender_chat.id
+
+    # MessageOriginChannel
+    chat = getattr(origin, "chat", None)
+    if chat:
+        return chat.id
+
+    return None
+
+
 # --- Обработчики команд Telegram ---
 
 HELP_TEXT = (
@@ -252,20 +289,23 @@ HELP_TEXT = (
     "   • <code>-nsfw</code> → исключить посты со словом nsfw\n\n"
     "   <i>Примеры:</i>\n"
     "   • <code>/search arknights n-10</code>\n"
-    "   • <code>/search arknights,nsfw n-5</code>\n"
-    "   • <code>/search arknights,nsfw -guro n-5 lang:en</code>\n"
-    "   • <code>/search apple,sun banana,moon n-10</code>\n\n"
-    "⏹ <b>/stop</b> — прервать текущий поиск\n"
-    "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code> — добавить аккаунт X\n"
+    "   • <code>/search arknights,nsfw -guro n-5 lang:en</code>\n\n"
+    "⏹ <b>/stop</b> — прервать поиск\n\n"
+    "📨 <b>Пересылка контактам:</b>\n"
+    "   <b>/add_target</b> — <i>ответом на пересланное сообщение</i> от контакта,\n"
+    "      либо <code>/add_target &lt;chat_id&gt;</code>\n"
+    "   <b>/targets</b> — список получателей\n"
+    "   <b>/remove_target</b> <code>&lt;chat_id&gt;</code> — убрать получателя\n\n"
+    "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code>\n"
     "📊 <b>/status</b> — статус аккаунтов X\n"
     "❓ <b>/help</b> — это меню\n\n"
     "━━━━━━━━━━━━━━━━━━━━━\n"
-    "💡 <i>Параметры поиска:</i>\n"
-    "• <code>n-N</code> — сколько постов искать (1–100)\n"
-    "• <code>lang:xx</code> — язык постов (en, ru, ja, ko…)\n"
-    "• <code>-тег</code> — исключить посты с этим словом\n"
-    "• <code>a,b</code> — AND: оба слова в посте\n"
-    "• <code>a b</code> — OR: любое из слов\n"
+    "💡 <b>Параметры /search:</b>\n"
+    "• <code>n-N</code> — сколько постов (1–100)\n"
+    "• <code>lang:xx</code> — язык (en, ru, ja, ko…)\n"
+    "• <code>-тег</code> — исключить\n"
+    "• <code>a,b</code> — AND\n"
+    "• <code>a b</code> — OR\n"
 )
 
 
@@ -290,11 +330,7 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await update.message.reply_text(
             "❌ <b>Использование:</b>\n"
-            "<code>/add_account &lt;auth_token&gt; &lt;ct0&gt;</code>\n\n"
-            "<b>Как получить cookies:</b>\n"
-            "1. Откройте x.com в браузере\n"
-            "2. F12 → Application → Cookies → https://x.com\n"
-            "3. Скопируйте значения <code>auth_token</code> и <code>ct0</code>",
+            "<code>/add_account &lt;auth_token&gt; &lt;ct0&gt;</code>",
             parse_mode="HTML"
         )
         return
@@ -325,6 +361,133 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{icon} <code>{esc(username)}</code>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# --- Команды управления получателями ---
+
+async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет получателя пересылки."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    chat_id = None
+
+    # Способ 1: ответ на пересланное сообщение от контакта
+    if update.message.reply_to_message:
+        chat_id = extract_chat_id_from_forward(update.message.reply_to_message)
+        if chat_id is None:
+            await update.message.reply_text(
+                "❌ Это сообщение не является пересланным от пользователя или канала.\n\n"
+                "<b>Как добавить получателя:</b>\n"
+                "1. Попросите контакта написать боту /start (иначе бот не сможет ему писать).\n"
+                "2. Перешлите любое его сообщение мне.\n"
+                "3. Ответьте на пересланное <code>/add_target</code>.\n\n"
+                "<i>Либо укажите chat_id вручную:</i> <code>/add_target &lt;chat_id&gt;</code>",
+                parse_mode="HTML"
+            )
+            return
+
+    # Способ 2: chat_id в аргументах
+    elif context.args:
+        raw = context.args[0].strip()
+        if raw.lstrip("-").isdigit():
+            chat_id = int(raw)
+        else:
+            await update.message.reply_text(
+                "❌ Не похоже на chat_id. Укажите число.\n"
+                "Например: <code>/add_target 123456789</code>",
+                parse_mode="HTML"
+            )
+            return
+
+    else:
+        await update.message.reply_text(
+            "<b>Как добавить получателя:</b>\n\n"
+            "1. Попросите контакта написать боту /start.\n"
+            "2. Перешлите любое его сообщение мне.\n"
+            "3. Ответьте на пересланное <code>/add_target</code>.\n\n"
+            "<i>Либо укажите chat_id вручную:</i> <code>/add_target &lt;chat_id&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if chat_id == ALLOWED_USER_ID:
+        await update.message.reply_text("⚠️ Это ваш собственный chat_id — вы и так получаете посты.")
+        return
+
+    if chat_id in EXTRA_TARGETS:
+        await update.message.reply_text(f"ℹ️ <code>{chat_id}</code> уже в списке.", parse_mode="HTML")
+        return
+
+    EXTRA_TARGETS.append(chat_id)
+    logger.info(f"Добавлен получатель: {chat_id}")
+
+    await update.message.reply_text(
+        f"✅ Получатель добавлен: <code>{chat_id}</code>\n\n"
+        f"📊 Всего получателей: <b>{len(EXTRA_TARGETS)}</b>\n\n"
+        f"<i>⚠️ На Render бесплатного плана список сбросится при "
+        f"следующем деплое. Чтобы сохранить — добавьте переменную "
+        f"окружения</i> <code>TARGET_CHAT_IDS</code> <i>со списком через запятую:</i>\n"
+        f"<code>{','.join(str(x) for x in EXTRA_TARGETS)}</code>",
+        parse_mode="HTML"
+    )
+
+
+async def list_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущих получателей."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    if not EXTRA_TARGETS:
+        await update.message.reply_text(
+            "📭 Дополнительных получателей нет.\n\n"
+            "Добавьте через /add_target.",
+            parse_mode="HTML"
+        )
+        return
+
+    lines = [
+        "📨 <b>Дополнительные получатели</b>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"👑 Владелец: <code>{ALLOWED_USER_ID}</code> (всегда)",
+    ]
+    for i, cid in enumerate(EXTRA_TARGETS, 1):
+        lines.append(f"{i}. <code>{cid}</code>")
+
+    lines.append("")
+    lines.append("<i>Убрать: /remove_target &lt;chat_id&gt;</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def remove_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет получателя."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "❌ Использование: <code>/remove_target &lt;chat_id&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    chat_id = int(context.args[0])
+    if chat_id not in EXTRA_TARGETS:
+        await update.message.reply_text(
+            f"🤷 <code>{chat_id}</code> нет в списке.",
+            parse_mode="HTML"
+        )
+        return
+
+    EXTRA_TARGETS.remove(chat_id)
+    logger.info(f"Удалён получатель: {chat_id}")
+
+    await update.message.reply_text(
+        f"🗑 Получатель удалён: <code>{chat_id}</code>\n"
+        f"Осталось получателей: <b>{len(EXTRA_TARGETS)}</b>",
+        parse_mode="HTML"
+    )
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,13 +533,18 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exclude_display = ", ".join(exclude) if exclude else "—"
     tags_display = format_groups_for_display(groups)
 
+    targets_info = (
+        f"👑 + {len(EXTRA_TARGETS)} 👥" if EXTRA_TARGETS else "👑 только вы"
+    )
+
     header = (
         "🔍 <b>Поиск запущен</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 <b>Теги:</b> <code>{esc(tags_display)}</code>\n"
         f"🚫 <b>Исключить:</b> <code>{esc(exclude_display)}</code>\n"
         f"🌐 <b>Язык:</b> <code>{esc(lang_display)}</code>\n"
-        f"📊 <b>Лимит:</b> <code>{limit}</code>"
+        f"📊 <b>Лимит:</b> <code>{limit}</code>\n"
+        f"📨 <b>Получатели:</b> {targets_info}"
     )
     msg = await update.message.reply_text(header, parse_mode="HTML")
 
@@ -391,8 +559,6 @@ async def _do_search(msg, context, groups, exclude, limit, lang):
     _search_active = True
 
     try:
-        # Формируем запрос:
-        #   группы через OR, слова внутри группы — через пробел (AND)
         group_strs = []
         for g in groups:
             if len(g) == 1:
@@ -412,18 +578,15 @@ async def _do_search(msg, context, groups, exclude, limit, lang):
         full_query = " ".join(query_parts)
         logger.info(f"Ищу: {full_query} (limit={limit})")
 
-        # Компенсируем возможную потерю после клиентских фильтров
         fetch_limit = min(limit + len(exclude) * 5, 100)
 
         tweets = await gather(api.search(full_query, limit=fetch_limit))
 
-        # Клиентский фильтр исключений
         if exclude:
             before = len(tweets)
             tweets = [t for t in tweets if not tweet_has_excluded(t, exclude)]
             logger.info(f"Клиентский фильтр исключений: {before} → {len(tweets)}")
 
-        # Обрезаем до запрошенного лимита
         if len(tweets) > limit:
             tweets = tweets[:limit]
 
@@ -431,7 +594,6 @@ async def _do_search(msg, context, groups, exclude, limit, lang):
             await msg.edit_text("😕 Ничего не найдено по этим тегам.")
             return
 
-        # Клиентская фильтрация по языку
         if lang:
             filtered = []
             for t in tweets:
@@ -546,12 +708,16 @@ async def run_bot():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
     application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("add_target", add_target))
+    application.add_handler(CommandHandler("targets", list_targets))
+    application.add_handler(CommandHandler("remove_target", remove_target))
 
     await application.initialize()
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
     await ensure_account()
+    load_targets_from_env()
 
     logger.info("Telegram-бот запущен.")
 
