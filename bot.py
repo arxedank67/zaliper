@@ -32,6 +32,11 @@ stop_event = asyncio.Event()
 _search_active = False
 EXTRA_TARGETS: list[int] = []
 
+# Список ID сообщений, отправленных ботом, по chat_id
+# Формат: {chat_id: [message_id, message_id, ...]}
+SENT_MESSAGES: dict[int, list[int]] = {}
+MAX_TRACKED_PER_CHAT = 3000
+
 http_session: aiohttp.ClientSession | None = None
 
 HEADERS = {
@@ -43,6 +48,24 @@ HEADERS = {
 
 def esc(s: str) -> str:
     return html.escape(s or "")
+
+
+def track_sent(chat_id: int, *messages):
+    """Запоминает ID отправленных ботом сообщений для будущего /clear."""
+    if chat_id not in SENT_MESSAGES:
+        SENT_MESSAGES[chat_id] = []
+
+    for m in messages:
+        if m is None:
+            continue
+        # send_media_group возвращает list — уже распакован вызывающим
+        mid = getattr(m, "message_id", None)
+        if mid is not None:
+            SENT_MESSAGES[chat_id].append(mid)
+
+    # Не даём списку расти бесконечно
+    if len(SENT_MESSAGES[chat_id]) > MAX_TRACKED_PER_CHAT:
+        SENT_MESSAGES[chat_id] = SENT_MESSAGES[chat_id][-MAX_TRACKED_PER_CHAT // 2:]
 
 
 def load_targets_from_env():
@@ -97,25 +120,30 @@ async def ensure_account():
 
 async def send_tweet_to(chat_id: int, photos_to_send: list, caption: str,
                         context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет один пост одному получателю. Трекает message_id для /clear."""
     if len(photos_to_send) == 1:
         with open(photos_to_send[0], "rb") as f:
-            await context.bot.send_photo(
+            m = await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=f,
                 caption=caption,
                 parse_mode="HTML"
             )
+            track_sent(chat_id, m)
     else:
         media_group = []
         for path in photos_to_send:
             with open(path, "rb") as f:
                 media_group.append(InputMediaPhoto(media=f))
-        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-        await context.bot.send_message(
+        sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+        # sent — list[Message]
+        track_sent(chat_id, *sent)
+        m = await context.bot.send_message(
             chat_id=chat_id,
             text=caption,
             parse_mode="HTML"
         )
+        track_sent(chat_id, m)
 
 
 async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE):
@@ -234,16 +262,13 @@ def format_groups_for_display(groups: list) -> str:
 
 
 def extract_chat_id_from_forward(message) -> tuple[int | None, str]:
-    """Возвращает (chat_id, описание_проблемы)."""
     origin = getattr(message, "forward_origin", None)
     if not origin:
         return None, "Сообщение не переслано."
 
-    # Определяем тип origin
     origin_type = origin.__class__.__name__
     logger.info(f"forward_origin type: {origin_type}")
 
-    # MessageOriginUser — пересылка от обычного пользователя
     sender_user = getattr(origin, "sender_user", None)
     if sender_user:
         if getattr(sender_user, "is_bot", False):
@@ -253,7 +278,6 @@ def extract_chat_id_from_forward(message) -> tuple[int | None, str]:
             )
         return sender_user.id, ""
 
-    # MessageOriginHiddenUser — пользователь скрыл свои пересылки
     if origin_type == "MessageOriginHiddenUser":
         return None, (
             "Получатель <b>скрыл пересылку</b> своих сообщений.\n\n"
@@ -262,12 +286,10 @@ def extract_chat_id_from_forward(message) -> tuple[int | None, str]:
             "и добавьте вручную: <code>/add_target &lt;chat_id&gt;</code>."
         )
 
-    # MessageOriginChat — пересылка из группы
     sender_chat = getattr(origin, "sender_chat", None)
     if sender_chat:
         return sender_chat.id, ""
 
-    # MessageOriginChannel — пересылка из канала
     chat = getattr(origin, "chat", None)
     if chat:
         return chat.id, ""
@@ -286,7 +308,8 @@ OWNER_HELP = (
     "   • <code>-nsfw</code> → исключить\n"
     "   • <code>n-10</code> → лимит 10\n"
     "   • <code>lang:en</code> → англ. язык\n\n"
-    "⏹ <b>/stop</b> — прервать поиск\n\n"
+    "⏹ <b>/stop</b> — прервать поиск\n"
+    "🗑 <b>/clear</b> — удалить все сообщения бота и временные файлы\n\n"
     "📨 <b>Пересылка контактам</b>\n"
     "   • <b>/add_target</b> — <i>ответом на пересланное сообщение от получателя</i>,\n"
     "     либо <code>/add_target &lt;chat_id&gt;</code>\n"
@@ -294,71 +317,82 @@ OWNER_HELP = (
     "   • <b>/remove_target</b> <code>&lt;chat_id&gt;</code> — убрать\n\n"
     "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code>\n"
     "📊 <b>/status</b> — статус аккаунтов X\n"
+    "🆔 <b>/my_id</b> — ваш chat_id\n"
     "❓ <b>/help</b> — это меню\n"
 )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if user_id == ALLOWED_USER_ID:
-        await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
+        m = await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
+        track_sent(chat_id, m)
         return
 
-    # Не владелец — показываем его ID, чтобы он мог сообщить его владельцу
-    await update.message.reply_text(
+    m = await update.message.reply_text(
         "👋 Привет! Этот бот — <b>приватный</b>.\n\n"
         f"🆔 Ваш <code>chat_id</code>: <code>{user_id}</code>\n\n"
         "Передайте его владельцу бота, чтобы получать от него посты.\n"
         "<i>Команды поиска доступны только владельцу.</i>",
         parse_mode="HTML"
     )
+    track_sent(chat_id, m)
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает chat_id текущего пользователя — доступно всем."""
     user_id = update.effective_user.id
     username = update.effective_user.username or "—"
-    await update.message.reply_text(
+    chat_id = update.effective_chat.id
+    m = await update.message.reply_text(
         f"🆔 Ваш <code>chat_id</code>: <code>{user_id}</code>\n"
         f"👤 Username: @{esc(username)}",
         parse_mode="HTML"
     )
+    track_sent(chat_id, m)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         await my_id(update, context)
         return
-    await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
+    chat_id = update.effective_chat.id
+    m = await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
+    track_sent(chat_id, m)
 
 
 async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
+    chat_id = update.effective_chat.id
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(
+        m = await update.message.reply_text(
             "❌ <b>Использование:</b>\n"
             "<code>/add_account &lt;auth_token&gt; &lt;ct0&gt;</code>",
             parse_mode="HTML"
         )
+        track_sent(chat_id, m)
         return
 
     auth_token, ct0 = args[0], args[1]
     if await add_twitter_account(auth_token, ct0):
-        await update.message.reply_text("✅ Аккаунт X успешно добавлен.")
+        m = await update.message.reply_text("✅ Аккаунт X успешно добавлен.")
     else:
-        await update.message.reply_text("❌ Не удалось добавить. Проверьте логи.")
+        m = await update.message.reply_text("❌ Не удалось добавить. Проверьте логи.")
+    track_sent(chat_id, m)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
+    chat_id = update.effective_chat.id
     accounts = await api.pool.accounts_info()
     if not accounts:
-        await update.message.reply_text("📭 Нет добавленных аккаунтов X.")
+        m = await update.message.reply_text("📭 Нет добавленных аккаунтов X.")
+        track_sent(chat_id, m)
         return
 
     lines = ["📊 <b>Статус аккаунтов</b>", "━━━━━━━━━━━━━━━━━━━━━"]
@@ -368,20 +402,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         icon = "✅" if is_active else "❌"
         lines.append(f"{icon} <code>{esc(username)}</code>")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    m = await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    track_sent(chat_id, m)
 
 
 async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
+    chat_id_self = update.effective_chat.id
     chat_id = None
 
-    # Способ 1: reply на пересланное сообщение
     if update.message.reply_to_message:
         chat_id, error = extract_chat_id_from_forward(update.message.reply_to_message)
         if chat_id is None:
-            await update.message.reply_text(
+            m = await update.message.reply_text(
                 f"❌ {error}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
                 "<b>Как правильно добавить получателя:</b>\n"
@@ -389,89 +424,88 @@ async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "(или отправить <code>/my_id</code>).\n"
                 "2. Получатель узнает свой <code>chat_id</code> и передаст его вам.\n"
                 "3. Добавьте его вручную:\n"
-                "   <code>/add_target &lt;chat_id&gt;</code>\n\n"
-                "<b>Или:</b> попросите получателя переслать вам любое <u>его</u> "
-                "сообщение боту, потом <u>вы</u> перешлите это сообщение мне "
-                "и ответьте на него <code>/add_target</code>.",
+                "   <code>/add_target &lt;chat_id&gt;</code>",
                 parse_mode="HTML"
             )
+            track_sent(chat_id_self, m)
             return
 
-    # Способ 2: chat_id в аргументах
     elif context.args:
         raw = context.args[0].strip()
         if raw.lstrip("-").isdigit():
             chat_id = int(raw)
         else:
-            await update.message.reply_text(
+            m = await update.message.reply_text(
                 "❌ Не похоже на chat_id. Укажите число.\n"
                 "Например: <code>/add_target 123456789</code>",
                 parse_mode="HTML"
             )
+            track_sent(chat_id_self, m)
             return
 
     else:
-        await update.message.reply_text(
+        m = await update.message.reply_text(
             "<b>Как добавить получателя:</b>\n\n"
             "1. Попросите получателя нажать <b>Start</b> в боте.\n"
             "2. Он получит свой <code>chat_id</code> и передаст вам.\n"
-            "3. Вы вводите: <code>/add_target &lt;chat_id&gt;</code>\n\n"
-            "<i>Либо</i> — попросите получателя переслать вам его сообщение, "
-            "перешлите его мне и ответьте <code>/add_target</code>.",
+            "3. Вы вводите: <code>/add_target &lt;chat_id&gt;</code>",
             parse_mode="HTML"
         )
+        track_sent(chat_id_self, m)
         return
 
     if chat_id == ALLOWED_USER_ID:
-        await update.message.reply_text("⚠️ Это ваш собственный ID — вы и так получаете посты.")
+        m = await update.message.reply_text("⚠️ Это ваш собственный ID.")
+        track_sent(chat_id_self, m)
         return
 
     if chat_id in EXTRA_TARGETS:
-        await update.message.reply_text(f"ℹ️ <code>{chat_id}</code> уже в списке.", parse_mode="HTML")
+        m = await update.message.reply_text(f"ℹ️ <code>{chat_id}</code> уже в списке.", parse_mode="HTML")
+        track_sent(chat_id_self, m)
         return
 
     EXTRA_TARGETS.append(chat_id)
     logger.info(f"Добавлен получатель: {chat_id}")
 
-    # Попробуем отправить получателю проверочное сообщение
     test_ok = True
     try:
-        await context.bot.send_message(
+        tm = await context.bot.send_message(
             chat_id=chat_id,
             text="🔔 Вас добавили в список получателей постов X Scroller.",
         )
+        track_sent(chat_id, tm)
     except Exception as e:
         test_ok = False
         logger.warning(f"Не удалось отправить тестовое сообщение {chat_id}: {e}")
 
     if test_ok:
-        await update.message.reply_text(
+        m = await update.message.reply_text(
             f"✅ Получатель добавлен: <code>{chat_id}</code>\n"
             f"📨 Проверочное сообщение отправлено — значит, бот сможет ему писать.\n\n"
             f"Всего получателей: <b>{len(EXTRA_TARGETS)}</b>",
             parse_mode="HTML"
         )
     else:
-        await update.message.reply_text(
+        m = await update.message.reply_text(
             f"⚠️ Получатель <code>{chat_id}</code> добавлен в список, "
             f"но бот <b>не смог ему написать</b>.\n\n"
-            f"<b>Что делать:</b> попросите получателя открыть бота и нажать "
-            f"<b>Start</b> (или отправить <code>/start</code>). "
-            f"Без этого Telegram запрещает боту писать первым.",
+            f"<b>Что делать:</b> попросите получателя нажать <b>Start</b> в боте.",
             parse_mode="HTML"
         )
+    track_sent(chat_id_self, m)
 
 
 async def list_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
+    chat_id = update.effective_chat.id
     if not EXTRA_TARGETS:
-        await update.message.reply_text(
-            "📭 Дополнительных получателей нет.\n\n"
-            "Добавьте через /add_target.",
+        m = await update.message.reply_text(
+            "📭 Дополнительных получателей нет.\n\nДобавьте через /add_target.",
             parse_mode="HTML"
         )
+        track_sent(chat_id, m)
         return
 
     lines = [
@@ -481,51 +515,122 @@ async def list_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     for i, cid in enumerate(EXTRA_TARGETS, 1):
         lines.append(f"{i}. <code>{cid}</code>")
-
     lines.append("")
     lines.append("<i>Убрать: /remove_target &lt;chat_id&gt;</i>")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    m = await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    track_sent(chat_id, m)
 
 
 async def remove_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
+    chat_id = update.effective_chat.id
     if not context.args or not context.args[0].lstrip("-").isdigit():
-        await update.message.reply_text(
+        m = await update.message.reply_text(
             "❌ Использование: <code>/remove_target &lt;chat_id&gt;</code>",
             parse_mode="HTML"
         )
+        track_sent(chat_id, m)
         return
 
-    chat_id = int(context.args[0])
-    if chat_id not in EXTRA_TARGETS:
-        await update.message.reply_text(
-            f"🤷 <code>{chat_id}</code> нет в списке.",
+    target = int(context.args[0])
+    if target not in EXTRA_TARGETS:
+        m = await update.message.reply_text(
+            f"🤷 <code>{target}</code> нет в списке.",
             parse_mode="HTML"
         )
+        track_sent(chat_id, m)
         return
 
-    EXTRA_TARGETS.remove(chat_id)
-    logger.info(f"Удалён получатель: {chat_id}")
+    EXTRA_TARGETS.remove(target)
+    logger.info(f"Удалён получатель: {target}")
 
-    await update.message.reply_text(
-        f"🗑 Получатель удалён: <code>{chat_id}</code>\n"
+    m = await update.message.reply_text(
+        f"🗑 Получатель удалён: <code>{target}</code>\n"
         f"Осталось получателей: <b>{len(EXTRA_TARGETS)}</b>",
         parse_mode="HTML"
     )
+    track_sent(chat_id, m)
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
+    chat_id = update.effective_chat.id
     if _search_active:
         stop_event.set()
-        await update.message.reply_text("⏹ Останавливаю поиск…")
+        m = await update.message.reply_text("⏹ Останавливаю поиск…")
     else:
-        await update.message.reply_text("🤷 Сейчас нечего останавливать.")
+        m = await update.message.reply_text("🤷 Сейчас нечего останавливать.")
+    track_sent(chat_id, m)
+
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет все сообщения, отправленные ботом в этом чате, и чистит temp_images."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    chat_id = update.effective_chat.id
+    ids = SENT_MESSAGES.pop(chat_id, [])
+
+    if not ids:
+        # Ничего не трекали — возможно, после перезапуска
+        m = await update.message.reply_text(
+            "🤷 Нечего удалять.\n\n"
+            "<i>Примечание: список трекается только с момента запуска бота. "
+            "После перезапуска старые сообщения удалить не получится.</i>",
+            parse_mode="HTML"
+        )
+        # Эту же плашку трекаем, чтобы следующий /clear её убрал
+        track_sent(chat_id, m)
+        return
+
+    # Пробуем удалить команду /clear саму
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    deleted = 0
+    failed = 0
+    for mid in ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception as e:
+            failed += 1
+            logger.debug(f"Не удалось удалить {mid}: {e}")
+        # Telegram: ~30 удалений в секунду. 0.05s = 20/сек — безопасно.
+        await asyncio.sleep(0.05)
+
+    # Чистим временные файлы
+    files_removed = 0
+    for f in TEMP_DIR.glob("*"):
+        try:
+            if f.is_file():
+                f.unlink()
+                files_removed += 1
+        except Exception:
+            pass
+
+    # Отправляем подтверждение (трекаем — уберётся следующим /clear)
+    m = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🗑 <b>Очистка завершена</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📨 Удалено сообщений: <b>{deleted}</b>\n"
+            f"⚠️ Не удалось удалить: <b>{failed}</b>\n"
+            f"📁 Удалено файлов: <b>{files_removed}</b>\n\n"
+            "<i>Сообщения старше 48 часов Telegram не даёт удалять боту — "
+            "они могли попасть в «не удалось».</i>"
+        ),
+        parse_mode="HTML"
+    )
+    track_sent(chat_id, m)
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -533,25 +638,31 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if _search_active:
-        await update.message.reply_text("⚠️ Поиск уже идёт. Дождитесь или /stop.")
+        chat_id = update.effective_chat.id
+        m = await update.message.reply_text("⚠️ Поиск уже идёт. Дождитесь или /stop.")
+        track_sent(chat_id, m)
         return
 
     if not context.args:
-        await update.message.reply_text(
+        chat_id = update.effective_chat.id
+        m = await update.message.reply_text(
             "❌ Укажите теги.\n"
             "<b>Пример:</b> <code>/search arknights,nsfw -guro n-5 lang:en</code>",
             parse_mode="HTML"
         )
+        track_sent(chat_id, m)
         return
 
     groups, exclude, limit, lang = parse_search_args(context.args)
 
     if not groups:
-        await update.message.reply_text(
+        chat_id = update.effective_chat.id
+        m = await update.message.reply_text(
             "❌ Не нашёл теги. Проверьте формат:\n"
             "<code>/search &lt;теги&gt; [-искл] [n-N] [lang:xx]</code>",
             parse_mode="HTML"
         )
+        track_sent(chat_id, m)
         return
 
     lang_display = lang if lang else "любой"
@@ -571,6 +682,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📨 <b>Получатели:</b> {targets_info}"
     )
     msg = await update.message.reply_text(header, parse_mode="HTML")
+    track_sent(update.effective_chat.id, msg)
 
     asyncio.create_task(_do_search(msg, context, groups, exclude, limit, lang))
 
@@ -728,6 +840,7 @@ async def run_bot():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
     application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("clear", clear))
     application.add_handler(CommandHandler("add_target", add_target))
     application.add_handler(CommandHandler("targets", list_targets))
     application.add_handler(CommandHandler("remove_target", remove_target))
