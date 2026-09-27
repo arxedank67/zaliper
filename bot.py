@@ -97,8 +97,9 @@ def get_user(user_id: int, username: str = "") -> UserState:
 
 def get_x_api(user: UserState) -> API:
     if user.x_api is None:
-        user.x_api = API(str(user.db_path))
-        logger.info(f"[u{user.user_id}] X API создан: {user.db_path}")
+        owner_db = DATA_DIR / f"accounts_{OWNER_USER_ID}.db"
+        user.x_api = API(str(owner_db))
+        logger.info(f"[u{user.user_id}] X API через owner-базу")
     return user.x_api
 
 
@@ -427,11 +428,6 @@ def help_text(user_id: int) -> str:
     base = (
         "🤖 <b>X Scroller Bot</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "⚙️ <b>Первый запуск:</b>\n"
-        "   <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code> —\n"
-        "   добавьте свой X-аккаунт (cookies).\n"
-        "   <i>Без него поиск работать не будет.</i>\n"
-        "   📱 С телефона? Смотрите <b>/help_mobile</b>\n\n"
         "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> "
         "<code>[n-N]</code> <code>[lang:xx]</code> <code>[type:T]</code>\n"
         "   <code>[since:ГГГГ-ММ-ДД]</code> <code>[until:ГГГГ-ММ-ДД]</code>\n"
@@ -446,9 +442,7 @@ def help_text(user_id: int) -> str:
         "⏹ <b>/stop</b> — прервать свой поиск\n"
         "🗑 <b>/clear</b> — удалить свои сообщения бота\n"
         "♻️ <b>/dedup</b> <code>on|off</code> — вкл/выкл дедупликацию\n"
-        "🧹 <b>/clear_dedup</b> — сбросить память дедупликации\n"
-        "📊 <b>/my_status</b> — статус вашего X-аккаунта\n"
-        "📱 <b>/help_mobile</b> — как получить cookies с телефона\n\n"
+        "🧹 <b>/clear_dedup</b> — сбросить память дедупликации\n\n"
         "📨 <b>Пересылка контактам</b>\n"
         "   • <b>/add_target</b> — ответом на пересланное\n"
         "     или <code>/add_target &lt;chat_id&gt;</code>\n"
@@ -467,7 +461,7 @@ def help_text(user_id: int) -> str:
 
     base += (
         "\n━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔐 <b>Приватность:</b> ваш X-аккаунт, цели и дедупликация "
+        "🔐 <b>Приватность:</b> цели и дедупликация "
         "хранятся отдельно и не видны другим.\n"
     )
     return base
@@ -562,17 +556,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     get_user(user_id, update.effective_user.username or "")
     m = await update.message.reply_text(help_text(user_id), parse_mode="HTML")
-    track_sent(chat_id, m)
-
-
-async def help_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    if not is_allowed(user_id):
-        m = await update.message.reply_text("⛔ Доступ ограничен.")
-        track_sent(chat_id, m)
-        return
-    m = await update.message.reply_text(MOBILE_HELP_TEXT, parse_mode="HTML")
     track_sent(chat_id, m)
 
 
@@ -945,11 +928,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = get_user(user_id, update.effective_user.username or "")
 
-    if not await user_has_active_x_account(user):
-        m = await update.message.reply_text(X_ACCOUNT_HELP, parse_mode="HTML")
-        track_sent(chat_id, m)
-        return
-
     if user.search_active:
         m = await update.message.reply_text("⚠️ У вас уже идёт поиск. /stop чтобы прервать.")
         track_sent(chat_id, m)
@@ -1020,8 +998,8 @@ async def _do_search(user: UserState, chat_id: int, msg,
         parts = [f"({include_part})"]
         for w in exclude:
             parts.append(f"-{w}")
-        if media_type in (None, "any", "photo", "video", "gif"):
-            parts.append("filter:images")
+        parts.append("filter:images")
+        parts.append("-filter:safe")
         if lang:
             parts.append(f"lang:{lang}")
         if since:
@@ -1162,10 +1140,7 @@ async def run_bot():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("help_mobile", help_mobile))
     application.add_handler(CommandHandler("my_id", my_id))
-    application.add_handler(CommandHandler("my_status", my_status))
-    application.add_handler(CommandHandler("add_account", add_account))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
     application.add_handler(CommandHandler("stop", stop))
