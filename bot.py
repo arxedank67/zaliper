@@ -3,6 +3,7 @@ import asyncio
 import html
 import logging
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
@@ -16,7 +17,10 @@ from twscrape.models import Tweet
 
 # --- Настройки ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "1660547849"))
+OWNER_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "1660547849"))
+
+DATA_DIR = Path("accounts_data")
+DATA_DIR.mkdir(exist_ok=True)
 
 TEMP_DIR = Path("temp_images")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -27,23 +31,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-api = API("accounts.db")
+# ---- Ограничение доступа ----
+_raw_allowed = os.environ.get("ALLOWED_USERS", "").strip()
+ALLOWED_USERS: set[int] | None = None
+if _raw_allowed:
+    ALLOWED_USERS = {OWNER_USER_ID}
+    for p in _raw_allowed.split(","):
+        p = p.strip()
+        if p.lstrip("-").isdigit():
+            ALLOWED_USERS.add(int(p))
+    logger.info(f"Whitelist активен: {sorted(ALLOWED_USERS)}")
 
-stop_event = asyncio.Event()
-_search_active = False
-EXTRA_TARGETS: list[int] = []
-
-# Трекинг отправленных сообщений (для /clear)
-SENT_MESSAGES: dict[int, list[int]] = {}
+MAX_USERS = 1000
+DEDUP_TTL = 3 * 60 * 60  # 3 часа
 MAX_TRACKED_PER_CHAT = 3000
 
-# ---- Дедупликация отправленных твитов ----
-# tweet_id -> timestamp добавления
-SENT_TWEETS: dict[int, float] = {}
-DEDUP_TTL = 3 * 60 * 60  # 3 часа в секундах
+# Семафор — не более 2 одновременных поисков ко X (общая защита от rate-limit)
+SEARCH_SEMAPHORE = asyncio.Semaphore(2)
 
 http_session: aiohttp.ClientSession | None = None
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -51,11 +57,69 @@ HEADERS = {
 }
 
 
+# ---- Модель пользователя ----
+
+@dataclass
+class UserState:
+    user_id: int
+    username: str = ""
+    x_api: API | None = None  # персональный API-инстанс (свой DB-файл)
+    targets: list[int] = field(default_factory=list)
+    dedup_enabled: bool = True
+    sent_tweets: dict[int, float] = field(default_factory=dict)
+    search_active: bool = False
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    total_searches: int = 0
+    total_posts: int = 0
+
+    @property
+    def db_path(self) -> Path:
+        return DATA_DIR / f"accounts_{self.user_id}.db"
+
+
+USER_DATA: dict[int, UserState] = {}
+SENT_MESSAGES: dict[int, list[int]] = {}
+
+
+def get_user(user_id: int, username: str = "") -> UserState:
+    u = USER_DATA.get(user_id)
+    if u is None:
+        if len(USER_DATA) >= MAX_USERS:
+            raise RuntimeError("Достигнут лимит пользователей")
+        u = UserState(user_id=user_id, username=username)
+        USER_DATA[user_id] = u
+        logger.info(f"New user: {user_id} (@{username})")
+    elif username:
+        u.username = username
+    u.last_seen = time.time()
+    return u
+
+
+def get_x_api(user: UserState) -> API:
+    """Ленивая инициализация персонального API twscrape."""
+    if user.x_api is None:
+        user.x_api = API(str(user.db_path))
+        logger.info(f"[u{user.user_id}] X API создан: {user.db_path}")
+    return user.x_api
+
+
+def is_allowed(user_id: int) -> bool:
+    if ALLOWED_USERS is None:
+        return True
+    return user_id in ALLOWED_USERS
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_USER_ID
+
+
+# ---- Утилиты ----
+
 def esc(s: str) -> str:
     return html.escape(s or "")
 
-
-# ---- Трекинг сообщений ----
 
 def track_sent(chat_id: int, *messages):
     if chat_id not in SENT_MESSAGES:
@@ -70,167 +134,175 @@ def track_sent(chat_id: int, *messages):
         SENT_MESSAGES[chat_id] = SENT_MESSAGES[chat_id][-MAX_TRACKED_PER_CHAT // 2:]
 
 
-# ---- Дедупликация ----
+# ---- Per-user dedup ----
 
-def is_already_sent(tweet_id: int) -> bool:
-    ts = SENT_TWEETS.get(tweet_id)
+def is_sent(user: UserState, tweet_id: int) -> bool:
+    if not user.dedup_enabled:
+        return False
+    ts = user.sent_tweets.get(tweet_id)
     if ts is None:
         return False
     if time.time() - ts > DEDUP_TTL:
-        del SENT_TWEETS[tweet_id]
+        del user.sent_tweets[tweet_id]
         return False
     return True
 
 
-def mark_sent(tweet_id: int):
-    SENT_TWEETS[tweet_id] = time.time()
+def mark_sent(user: UserState, tweet_id: int):
+    if user.dedup_enabled:
+        user.sent_tweets[tweet_id] = time.time()
 
 
-def cleanup_old_sent() -> int:
+def cleanup_user_dedup(user: UserState) -> int:
     now = time.time()
-    expired = [tid for tid, ts in SENT_TWEETS.items() if now - ts > DEDUP_TTL]
+    expired = [tid for tid, ts in user.sent_tweets.items() if now - ts > DEDUP_TTL]
     for tid in expired:
-        del SENT_TWEETS[tid]
+        del user.sent_tweets[tid]
     return len(expired)
 
 
 async def dedup_cleanup_loop():
-    """Каждые 30 минут чистит устаревшие записи дедупликации."""
     while True:
         await asyncio.sleep(30 * 60)
-        removed = cleanup_old_sent()
-        if removed:
-            logger.info(f"Dedup cleanup: удалено {removed}, осталось {len(SENT_TWEETS)}")
+        total = sum(cleanup_user_dedup(u) for u in USER_DATA.values())
+        if total:
+            logger.info(f"Dedup cleanup: removed {total} entries")
 
 
-def load_targets_from_env():
-    raw = os.environ.get("TARGET_CHAT_IDS", "").strip()
-    if not raw:
-        return
-    for part in raw.split(","):
-        p = part.strip()
-        if p.lstrip("-").isdigit():
-            cid = int(p)
-            if cid != ALLOWED_USER_ID and cid not in EXTRA_TARGETS:
-                EXTRA_TARGETS.append(cid)
-    if EXTRA_TARGETS:
-        logger.info(f"Загружено получателей из env: {EXTRA_TARGETS}")
+async def user_cleanup_loop():
+    """Раз в сутки удаляет неактивных пользователей без данных."""
+    while True:
+        await asyncio.sleep(24 * 60 * 60)
+        now = time.time()
+        to_remove = []
+        for uid, u in USER_DATA.items():
+            if uid == OWNER_USER_ID:
+                continue
+            inactive = now - u.last_seen > 7 * 24 * 60 * 60
+            if inactive and not u.targets and not u.sent_tweets:
+                to_remove.append(uid)
+        for uid in to_remove:
+            u = USER_DATA.pop(uid, None)
+            if u and u.db_path.exists():
+                try:
+                    u.db_path.unlink()
+                except Exception:
+                    pass
+        if to_remove:
+            logger.info(f"User cleanup: removed {len(to_remove)} inactive users")
 
 
-# ---- Twitter helpers ----
+# ---- X account helpers ----
 
-async def add_twitter_account(auth_token: str, ct0: str):
+async def add_x_account(user: UserState, auth_token: str, ct0: str) -> bool:
+    """Добавляет X-аккаунт в персональный пул пользователя."""
     try:
+        api = get_x_api(user)
+        # username должен быть уникальным внутри БД пользователя
+        acc_name = f"u{user.user_id}"
         await api.pool.add_account_cookies(
-            "main_account",
+            acc_name,
             f"auth_token={auth_token}; ct0={ct0}"
         )
-        logger.info("Аккаунт X успешно добавлен.")
+        logger.info(f"[u{user.user_id}] X аккаунт добавлен")
         return True
     except Exception as e:
-        logger.error(f"Ошибка добавления аккаунта: {e}")
+        logger.error(f"[u{user.user_id}] ошибка добавления X аккаунта: {e}")
         return False
 
 
-async def ensure_account():
+async def user_has_active_x_account(user: UserState) -> bool:
+    if user.x_api is None:
+        # Попробуем инициализировать, если есть файл
+        if user.db_path.exists():
+            get_x_api(user)
+        else:
+            return False
     try:
-        accounts = await api.pool.accounts_info()
-        if accounts and any(acc.get("active") for acc in accounts):
-            logger.info(f"Активных аккаунтов X: {len(accounts)}")
-            return
-    except Exception as e:
-        logger.warning(f"Не удалось прочитать пул аккаунтов: {e}")
+        accounts = await user.x_api.pool.accounts_info()
+        return bool(accounts) and any(a.get("active") for a in accounts)
+    except Exception:
+        return False
 
+
+async def ensure_owner_account():
+    """Восстанавливает X-аккаунт владельца из env (только для владельца)."""
     auth = os.environ.get("X_AUTH_TOKEN")
     ct0 = os.environ.get("X_CT0")
-    if auth and ct0:
-        logger.info("Аккаунт не найден, восстанавливаю из env…")
-        await add_twitter_account(auth, ct0)
-    else:
-        logger.warning(
-            "Аккаунт X не найден. Добавьте через /add_account "
-            "или задайте X_AUTH_TOKEN + X_CT0."
-        )
+    if not (auth and ct0):
+        return
+
+    owner = get_user(OWNER_USER_ID, "owner")
+    if await user_has_active_x_account(owner):
+        logger.info("Owner X аккаунт уже есть в БД.")
+        return
+
+    logger.info("Восстанавливаю owner X аккаунт из env…")
+    await add_x_account(owner, auth, ct0)
 
 
 # ---- Типы медиа ----
 
 def tweet_matches_media_type(tweet: Tweet, media_type: str | None) -> bool:
-    """Проверяет, соответствует ли пост заданному типу медиа."""
-    if media_type is None or media_type == "any":
+    if media_type in (None, "any"):
         return True
-
     media = tweet.media
-
     if media_type == "text":
         return media is None
-
     if media is None:
         return False
-
     has_photos = bool(getattr(media, "photos", None))
     has_videos = bool(getattr(media, "videos", None))
     has_animated = bool(getattr(media, "animated", None))
-
     if media_type == "photo":
         return has_photos
     if media_type == "video":
         return has_videos
     if media_type == "gif":
         return has_animated
-
     return True
 
 
-def media_type_icon(media_type: str | None) -> str:
+def media_type_icon(mt: str | None) -> str:
     return {
-        None: "📎 любой",
-        "any": "📎 любой",
-        "photo": "🖼 фото",
-        "video": "🎬 видео",
-        "gif": "🎞 gif",
-        "text": "📝 текст",
-    }.get(media_type, "📎 любой")
+        None: "📎", "any": "📎", "photo": "🖼",
+        "video": "🎬", "gif": "🎞", "text": "📝",
+    }.get(mt, "📎")
 
 
 # ---- Отправка ----
 
-async def send_tweet_to(chat_id: int, photos_to_send: list, caption: str,
+async def send_tweet_to(chat_id: int, photos: list, caption: str,
                         context: ContextTypes.DEFAULT_TYPE):
-    if len(photos_to_send) == 1:
-        with open(photos_to_send[0], "rb") as f:
+    if len(photos) == 1:
+        with open(photos[0], "rb") as f:
             m = await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=f,
-                caption=caption,
-                parse_mode="HTML"
+                chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML"
             )
             track_sent(chat_id, m)
     else:
         media_group = []
-        for path in photos_to_send:
-            with open(path, "rb") as f:
+        for p in photos:
+            with open(p, "rb") as f:
                 media_group.append(InputMediaPhoto(media=f))
         sent = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
         track_sent(chat_id, *sent)
         m = await context.bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            parse_mode="HTML"
+            chat_id=chat_id, text=caption, parse_mode="HTML"
         )
         track_sent(chat_id, m)
 
 
-async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE):
-    media_list = tweet.media
-    if not media_list:
+async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE,
+                               recipients: list[int]) -> int:
+    media = tweet.media
+    if not media:
         return 0
-
-    photos = getattr(media_list, "photos", None)
+    photos = getattr(media, "photos", None)
     if not photos:
         return 0
 
-    photos_to_send = []
+    files = []
     for i, photo in enumerate(photos[:10]):
         url = getattr(photo, "url", None)
         if not url:
@@ -239,48 +311,42 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
                 url = f"https://pbs.twimg.com/media/{pid}.jpg"
         if not url:
             continue
-
-        file_path = TEMP_DIR / f"{tweet.id}_{i}.jpg"
+        fp = TEMP_DIR / f"{tweet.id}_{i}.jpg"
         try:
             async with http_session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
-                    with open(file_path, "wb") as f:
+                    with open(fp, "wb") as f:
                         f.write(await resp.read())
-                    photos_to_send.append(file_path)
-                else:
-                    logger.error(f"[DEBUG] HTTP {resp.status} для {url}")
+                    files.append(fp)
         except Exception as e:
-            logger.error(f"[DEBUG] Исключение при скачивании {url}: {e}")
+            logger.error(f"[DL] {url}: {e}")
 
-    if not photos_to_send:
+    if not files:
         return 0
 
-    text_preview = esc(tweet.rawContent[:180]) if tweet.rawContent else ""
+    preview = esc(tweet.rawContent[:180]) if tweet.rawContent else ""
     caption = (
         f'🔗 <a href="https://x.com/i/status/{tweet.id}">Ссылка на пост</a>\n'
-        f'📝 <i>{text_preview}</i>'
+        f'📝 <i>{preview}</i>'
     )
 
-    recipients = [ALLOWED_USER_ID] + EXTRA_TARGETS
-
-    for chat_id in recipients:
+    for cid in recipients:
         try:
-            await send_tweet_to(chat_id, photos_to_send, caption, context)
+            await send_tweet_to(cid, files, caption, context)
             if len(recipients) > 1:
                 await asyncio.sleep(0.7)
         except Exception as e:
-            logger.error(f"Ошибка отправки в {chat_id}: {e}")
+            logger.error(f"Отправка в {cid}: {e}")
 
-    for path in photos_to_send:
-        path.unlink(missing_ok=True)
+    for p in files:
+        p.unlink(missing_ok=True)
 
-    return len(photos_to_send)
+    return len(files)
 
 
-# ---- Парсер ----
+# ---- Парсер /search ----
 
-def parse_search_args(args: list) -> tuple[list, list, int, str | None, str | None]:
-    """Возвращает (groups, exclude, limit, lang, media_type)."""
+def parse_search_args(args: list):
     include_groups = []
     exclude = []
     limit = 20
@@ -291,19 +357,15 @@ def parse_search_args(args: list) -> tuple[list, list, int, str | None, str | No
         arg = raw.strip()
         if not arg:
             continue
-
         if arg.startswith("n-") and arg[2:].isdigit():
             limit = max(1, min(100, int(arg[2:])))
             continue
-
         if arg.startswith("lang:") or arg.startswith("lang-"):
             code = arg.split(":", 1)[1] if ":" in arg else arg.split("-", 1)[1]
             code = code.strip().lower()
             if 2 <= len(code) <= 5:
                 lang = code
             continue
-
-        # type:photo / type:video / type:gif / type:text / type:any
         if arg.startswith("type:"):
             t = arg.split(":", 1)[1].strip().lower()
             mapping = {
@@ -316,17 +378,15 @@ def parse_search_args(args: list) -> tuple[list, list, int, str | None, str | No
             if t in mapping:
                 media_type = mapping[t]
             continue
-
         if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
             word = arg[1:].strip().lstrip("#")
             if word:
                 exclude.append(word)
             continue
-
         parts = [p.strip().lstrip("#") for p in arg.split(",")]
-        group = [p for p in parts if p]
-        if group:
-            include_groups.append(group)
+        g = [p for p in parts if p]
+        if g:
+            include_groups.append(g)
 
     return include_groups, exclude, limit, lang, media_type
 
@@ -335,8 +395,8 @@ def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
     if not exclude:
         return False
     text = (tweet.rawContent or "").lower()
-    for word in exclude:
-        w = word.lower().lstrip("#")
+    for w in exclude:
+        w = w.lower().lstrip("#")
         if w and w in text:
             return True
     return False
@@ -345,94 +405,128 @@ def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
 def format_groups_for_display(groups: list) -> str:
     parts = []
     for g in groups:
-        if len(g) == 1:
-            parts.append(g[0])
-        else:
-            parts.append(" + ".join(g))
+        parts.append(g[0] if len(g) == 1 else " + ".join(g))
     return "  |  ".join(parts)
 
 
-def extract_chat_id_from_forward(message) -> tuple[int | None, str]:
+def extract_chat_id_from_forward(message):
     origin = getattr(message, "forward_origin", None)
     if not origin:
         return None, "Сообщение не переслано."
-
-    origin_type = origin.__class__.__name__
-    logger.info(f"forward_origin type: {origin_type}")
-
     sender_user = getattr(origin, "sender_user", None)
     if sender_user:
         if getattr(sender_user, "is_bot", False):
-            return None, (
-                "Это сообщение переслано от <b>бота</b>, а не от человека.\n\n"
-                "Перешли сообщение <u>от получателя</u>, а не мой ответ ему."
-            )
+            return None, "Это сообщение от бота. Перешлите от получателя."
         return sender_user.id, ""
-
-    if origin_type == "MessageOriginHiddenUser":
-        return None, (
-            "Получатель <b>скрыл пересылку</b> своих сообщений.\n\n"
-            "Попросите его прислать <code>chat_id</code> через <code>/my_id</code> "
-            "и добавьте вручную: <code>/add_target &lt;chat_id&gt;</code>."
-        )
-
+    if origin.__class__.__name__ == "MessageOriginHiddenUser":
+        return None, ("Получатель скрыл пересылку. "
+                      "Попросите прислать chat_id через /my_id.")
     sender_chat = getattr(origin, "sender_chat", None)
     if sender_chat:
         return sender_chat.id, ""
-
     chat = getattr(origin, "chat", None)
     if chat:
         return chat.id, ""
+    return None, "Не удалось определить отправителя."
 
-    return None, "Не удалось определить отправителя пересланного сообщения."
+
+# ---- Help ----
+
+def help_text(user_id: int) -> str:
+    base = (
+        "🤖 <b>X Scroller Bot</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚙️ <b>Первый запуск:</b>\n"
+        "   <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code> —\n"
+        "   добавьте свой X-аккаунт (cookies).\n"
+        "   <i>Без него поиск работать не будет.</i>\n\n"
+        "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> "
+        "<code>[n-N]</code> <code>[lang:xx]</code> <code>[type:T]</code>\n"
+        "   • <code>apple sun</code> → apple <b>ИЛИ</b> sun\n"
+        "   • <code>apple,sun</code> → apple <b>И</b> sun\n"
+        "   • <code>-nsfw</code> → исключить\n"
+        "   • <code>n-10</code> → лимит (1–100)\n"
+        "   • <code>lang:en</code> → язык\n"
+        "   • <code>type:photo|video|gif|text|any</code>\n\n"
+        "⏹ <b>/stop</b> — прервать свой поиск\n"
+        "🗑 <b>/clear</b> — удалить свои сообщения бота\n"
+        "♻️ <b>/dedup</b> <code>on|off</code> — вкл/выкл дедупликацию\n"
+        "🧹 <b>/clear_dedup</b> — сбросить память дедупликации\n"
+        "📊 <b>/my_status</b> — статус вашего X-аккаунта\n\n"
+        "📨 <b>Пересылка контактам</b>\n"
+        "   • <b>/add_target</b> — ответом на пересланное\n"
+        "     или <code>/add_target &lt;chat_id&gt;</code>\n"
+        "   • <b>/targets</b> — список\n"
+        "   • <b>/remove_target</b> <code>&lt;chat_id&gt;</code>\n\n"
+        "🆔 <b>/my_id</b> — ваш chat_id\n"
+        "❓ <b>/help</b> — это меню\n"
+    )
+
+    if is_owner(user_id):
+        base += (
+            "\n━━━━━━━━━━━━━━━━━━━━━\n"
+            "👑 <b>Админ-команды</b>\n"
+            "   • <b>/status</b> — глобальная статистика\n"
+        )
+
+    base += (
+        "\n━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔐 <b>Приватность:</b> ваш X-аккаунт, цели и дедупликация "
+        "хранятся отдельно и не видны другим.\n"
+    )
+    return base
 
 
-# ---- Команды ----
-
-OWNER_HELP = (
-    "🤖 <b>X Scroller Bot</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> <code>[n-N]</code> <code>[lang:xx]</code> <code>[type:T]</code>\n"
-    "   • <code>apple sun</code> → apple <b>ИЛИ</b> sun\n"
-    "   • <code>apple,sun</code> → apple <b>И</b> sun\n"
-    "   • <code>-nsfw</code> → исключить\n"
-    "   • <code>n-10</code> → лимит 10\n"
-    "   • <code>lang:en</code> → англ. язык\n"
-    "   • <code>type:photo</code> / <code>type:video</code> / <code>type:gif</code>\n"
-    "     / <code>type:text</code> / <code>type:any</code>\n\n"
-    "⏹ <b>/stop</b> — прервать поиск\n"
-    "🗑 <b>/clear</b> — удалить все сообщения бота и файлы\n"
-    "♻️ <b>/clear_dedup</b> — очистить память о уже отправленных постах\n\n"
-    "📨 <b>Пересылка контактам</b>\n"
-    "   • <b>/add_target</b> — ответом на пересланное сообщение\n"
-    "     или <code>/add_target &lt;chat_id&gt;</code>\n"
-    "   • <b>/targets</b> — список получателей\n"
-    "   • <b>/remove_target</b> <code>&lt;chat_id&gt;</code> — убрать\n\n"
-    "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code>\n"
-    "📊 <b>/status</b> — статус аккаунтов X\n"
-    "🆔 <b>/my_id</b> — ваш chat_id\n"
-    "❓ <b>/help</b> — это меню\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "♻️ <b>Дедупликация:</b> посты, уже отправленные ботом, "
-    "не будут присылаться снова в течение <b>3 часов</b>.\n"
+X_ACCOUNT_HELP = (
+    "❌ <b>У вас нет X-аккаунта</b>\n\n"
+    "<b>Как добавить:</b>\n"
+    "1. Откройте x.com в браузере (где вы залогинены).\n"
+    "2. Нажмите <b>F12</b> → <b>Application</b> → <b>Cookies</b> → "
+    "<code>https://x.com</code>.\n"
+    "3. Скопируйте два значения:\n"
+    "   • <code>auth_token</code>\n"
+    "   • <code>ct0</code>\n"
+    "4. Отправьте боту:\n"
+    "   <code>/add_account ВАШ_auth_token ВАШ_ct0</code>\n\n"
+    "<i>⚠️ Cookies — это доступ к вашему аккаунту X. "
+    "Используйте свой аккаунт, не чужой.</i>"
 )
 
 
+# ---- Handlers ----
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    username = update.effective_user.username or ""
     chat_id = update.effective_chat.id
-    if user_id == ALLOWED_USER_ID:
-        m = await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
+
+    if not is_allowed(user_id):
+        m = await update.message.reply_text(
+            "⛔ Доступ ограничен. Обратитесь к владельцу бота.\n\n"
+            f"🆔 Ваш ID: <code>{user_id}</code>",
+            parse_mode="HTML"
+        )
         track_sent(chat_id, m)
         return
 
+    get_user(user_id, username)
     m = await update.message.reply_text(
-        "👋 Привет! Этот бот — <b>приватный</b>.\n\n"
-        f"🆔 Ваш <code>chat_id</code>: <code>{user_id}</code>\n\n"
-        "Передайте его владельцу бота, чтобы получать от него посты.\n"
-        "<i>Команды поиска доступны только владельцу.</i>",
+        f"👋 Привет, {esc(update.effective_user.first_name or 'друг')}!\n\n"
+        + help_text(user_id),
         parse_mode="HTML"
     )
+    track_sent(chat_id, m)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id):
+        m = await update.message.reply_text("⛔ Доступ ограничен.")
+        track_sent(chat_id, m)
+        return
+    get_user(user_id, update.effective_user.username or "")
+    m = await update.message.reply_text(help_text(user_id), parse_mode="HTML")
     track_sent(chat_id, m)
 
 
@@ -448,241 +542,330 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_sent(chat_id, m)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        await my_id(update, context)
-        return
-    chat_id = update.effective_chat.id
-    m = await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
-    track_sent(chat_id, m)
-
-
 async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
+    """Каждый пользователь добавляет СВОЙ X-аккаунт."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id):
+        m = await update.message.reply_text("⛔ Доступ ограничен.")
+        track_sent(chat_id, m)
         return
 
-    chat_id = update.effective_chat.id
-    args = context.args
-    if len(args) < 2:
+    user = get_user(user_id, update.effective_user.username or "")
+
+    if len(context.args) < 2:
         m = await update.message.reply_text(
             "❌ <b>Использование:</b>\n"
-            "<code>/add_account &lt;auth_token&gt; &lt;ct0&gt;</code>",
+            "<code>/add_account &lt;auth_token&gt; &lt;ct0&gt;</code>\n\n"
+            "<b>Как получить cookies:</b>\n"
+            "1. Откройте x.com в браузере (залогинившись).\n"
+            "2. F12 → Application → Cookies → https://x.com\n"
+            "3. Скопируйте значения <code>auth_token</code> и <code>ct0</code>",
             parse_mode="HTML"
         )
         track_sent(chat_id, m)
         return
 
-    auth_token, ct0 = args[0], args[1]
-    if await add_twitter_account(auth_token, ct0):
-        m = await update.message.reply_text("✅ Аккаунт X успешно добавлен.")
-    else:
-        m = await update.message.reply_text("❌ Не удалось добавить. Проверьте логи.")
-    track_sent(chat_id, m)
+    auth_token, ct0 = context.args[0], context.args[1]
 
+    # Удалим сообщение с токенами ради безопасности
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
+    status_msg = await update.message.reply_text("⏳ Проверяю X-аккаунт…")
+    ok = await add_x_account(user, auth_token, ct0)
+
+    if not ok:
+        await status_msg.edit_text("❌ Не удалось добавить X-аккаунт. Проверьте логи.")
         return
 
+    # Проверяем активность — сделаем тестовый поиск
+    try:
+        api = get_x_api(user)
+        accounts = await api.pool.accounts_info()
+        active = [a for a in accounts if a.get("active")]
+        if not active:
+            await status_msg.edit_text(
+                "⚠️ Cookies добавлены, но аккаунт помечен как неактивный.\n"
+                "Возможно, они устарели. Попробуйте заново."
+            )
+            return
+    except Exception as e:
+        logger.error(f"[u{user.user_id}] проверка аккаунта: {e}")
+
+    await status_msg.edit_text(
+        "✅ <b>X-аккаунт добавлен!</b>\n\n"
+        "Теперь можно искать: <code>/search arknights n-5</code>",
+        parse_mode="HTML"
+    )
+
+
+async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Личный статус пользователя."""
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    accounts = await api.pool.accounts_info()
+    if not is_allowed(user_id):
+        return
+    user = get_user(user_id, update.effective_user.username or "")
 
-    lines = ["📊 <b>Статус системы</b>", "━━━━━━━━━━━━━━━━━━━━━"]
+    lines = ["📊 <b>Ваш статус</b>", "━━━━━━━━━━━━━━━━━━━━━"]
 
-    if accounts:
-        lines.append("👤 <b>Аккаунты X:</b>")
-        for acc in accounts:
-            username = acc.get("username", "unknown")
-            is_active = acc.get("active", False)
-            icon = "✅" if is_active else "❌"
-            lines.append(f"   {icon} <code>{esc(username)}</code>")
+    if await user_has_active_x_account(user):
+        try:
+            accounts = await user.x_api.pool.accounts_info()
+            lines.append("👤 <b>X-аккаунт:</b>")
+            for acc in accounts:
+                icon = "✅" if acc.get("active") else "❌"
+                lines.append(f"   {icon} <code>{esc(acc.get('username', '?'))}</code>")
+        except Exception:
+            lines.append("👤 <b>X-аккаунт:</b> ✅ (активен)")
     else:
-        lines.append("👤 <b>Аккаунты X:</b> нет")
+        lines.append("👤 <b>X-аккаунт:</b> ❌ не добавлен")
+        lines.append("   <i>Используйте /add_account</i>")
 
     lines.append("")
-    lines.append("♻️ <b>Дедупликация:</b>")
-    lines.append(f"   📦 Хранится постов: <b>{len(SENT_TWEETS)}</b>")
-    lines.append(f"   ⏱ TTL: <b>3 часа</b>")
-
-    lines.append("")
-    lines.append("📨 <b>Доп. получатели:</b> " + (str(len(EXTRA_TARGETS)) if EXTRA_TARGETS else "нет"))
+    lines.append(f"🔍 Поисков всего: <b>{user.total_searches}</b>")
+    lines.append(f"📤 Отправлено постов: <b>{user.total_posts}</b>")
+    lines.append(f"📨 Получателей: <b>{len(user.targets)}</b>")
+    lines.append(f"♻️ Дедуп: {'🟢 вкл' if user.dedup_enabled else '🔴 выкл'} "
+                 f"(<b>{len(user.sent_tweets)}</b> записей)")
 
     m = await update.message.reply_text("\n".join(lines), parse_mode="HTML")
     track_sent(chat_id, m)
 
 
-async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Глобальная статистика (только владелец)."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_owner(user_id):
+        m = await update.message.reply_text("⛔ Только владелец бота.")
+        track_sent(chat_id, m)
         return
 
+    total_dedup = sum(len(u.sent_tweets) for u in USER_DATA.values())
+    active_searches = sum(1 for u in USER_DATA.values() if u.search_active)
+    total_posts = sum(u.total_posts for u in USER_DATA.values())
+    total_searches = sum(u.total_searches for u in USER_DATA.values())
+
+    # Считаем, у кого есть свой X-аккаунт
+    with_x = 0
+    for u in USER_DATA.values():
+        if u.db_path.exists():
+            with_x += 1
+
+    lines = [
+        "📊 <b>Глобальная статистика</b>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"👥 Пользователей: <b>{len(USER_DATA)}</b>",
+        f"👤 Из них с X-аккаунтом: <b>{with_x}</b>",
+        f"🔍 Активных поисков: <b>{active_searches}</b>",
+        f"📈 Всего поисков: <b>{total_searches}</b>",
+        f"📤 Отправлено постов: <b>{total_posts}</b>",
+        f"♻️ Записей в дедупе: <b>{total_dedup}</b>",
+        "",
+        "🕒 <b>Последние 5 пользователей:</b>",
+    ]
+    recent = sorted(USER_DATA.values(), key=lambda u: u.last_seen, reverse=True)[:5]
+    for u in recent:
+        mark = "👑" if u.user_id == OWNER_USER_ID else "👤"
+        has_x = "🟢" if u.db_path.exists() else "🔴"
+        lines.append(
+            f"   {mark} {has_x} <code>{u.user_id}</code> "
+            f"(@{esc(u.username) or '—'}) — {u.total_searches}🔍"
+        )
+
+    m = await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    track_sent(chat_id, m)
+
+
+async def dedup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id):
+        return
+    user = get_user(user_id, update.effective_user.username or "")
+
+    if not context.args:
+        state = "🟢 включена" if user.dedup_enabled else "🔴 выключена"
+        m = await update.message.reply_text(
+            f"♻️ <b>Дедупликация</b>: {state}\n"
+            f"📦 Записей: <b>{len(user.sent_tweets)}</b>\n"
+            f"⏱ TTL: <b>3 часа</b>\n\n"
+            f"<i>Переключить:</i> <code>/dedup on</code> | <code>/dedup off</code>",
+            parse_mode="HTML"
+        )
+        track_sent(chat_id, m)
+        return
+
+    arg = context.args[0].strip().lower()
+    if arg in ("on", "1", "true", "вкл", "включить"):
+        user.dedup_enabled = True
+        m = await update.message.reply_text("🟢 Дедупликация включена.")
+    elif arg in ("off", "0", "false", "выкл", "выключить"):
+        user.dedup_enabled = False
+        m = await update.message.reply_text(
+            "🔴 Дедупликация выключена. Посты могут приходить повторно."
+        )
+    else:
+        m = await update.message.reply_text("❌ Используйте: /dedup on | off")
+    track_sent(chat_id, m)
+
+
+async def clear_dedup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id):
+        return
+    user = get_user(user_id)
+    n = len(user.sent_tweets)
+    user.sent_tweets.clear()
+    m = await update.message.reply_text(
+        f"♻️ Память дедупликации сброшена. Удалено: <b>{n}</b>",
+        parse_mode="HTML"
+    )
+    track_sent(chat_id, m)
+
+
+async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     chat_id_self = update.effective_chat.id
-    chat_id = None
+    if not is_allowed(user_id):
+        return
+    user = get_user(user_id, update.effective_user.username or "")
 
+    target = None
     if update.message.reply_to_message:
-        chat_id, error = extract_chat_id_from_forward(update.message.reply_to_message)
-        if chat_id is None:
+        target, err = extract_chat_id_from_forward(update.message.reply_to_message)
+        if target is None:
             m = await update.message.reply_text(
-                f"❌ {error}\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "<b>Как правильно добавить получателя:</b>\n"
-                "1. Попросите контакта открыть бота и нажать <b>Start</b>.\n"
-                "2. Он передаст вам свой <code>chat_id</code> (через <code>/my_id</code>).\n"
-                "3. Добавьте: <code>/add_target &lt;chat_id&gt;</code>",
+                f"❌ {err}\n\n"
+                "Добавьте вручную: <code>/add_target &lt;chat_id&gt;</code>",
                 parse_mode="HTML"
             )
             track_sent(chat_id_self, m)
             return
-
-    elif context.args:
-        raw = context.args[0].strip()
-        if raw.lstrip("-").isdigit():
-            chat_id = int(raw)
-        else:
-            m = await update.message.reply_text(
-                "❌ Не похоже на chat_id. Укажите число.",
-                parse_mode="HTML"
-            )
-            track_sent(chat_id_self, m)
-            return
-
+    elif context.args and context.args[0].lstrip("-").isdigit():
+        target = int(context.args[0])
     else:
         m = await update.message.reply_text(
-            "<b>Как добавить получателя:</b>\n\n"
-            "1. Попросите получателя нажать <b>Start</b> в боте.\n"
-            "2. Он получит свой <code>chat_id</code> и передаст вам.\n"
-            "3. Вы вводите: <code>/add_target &lt;chat_id&gt;</code>",
-            parse_mode="HTML"
+            "❌ <code>/add_target &lt;chat_id&gt;</code> или ответом на пересланное."
         )
         track_sent(chat_id_self, m)
         return
 
-    if chat_id == ALLOWED_USER_ID:
-        m = await update.message.reply_text("⚠️ Это ваш собственный ID.")
+    if target == user_id:
+        m = await update.message.reply_text("⚠️ Это ваш ID.")
+        track_sent(chat_id_self, m)
+        return
+    if target in user.targets:
+        m = await update.message.reply_text(f"ℹ️ <code>{target}</code> уже в списке.", parse_mode="HTML")
         track_sent(chat_id_self, m)
         return
 
-    if chat_id in EXTRA_TARGETS:
-        m = await update.message.reply_text(f"ℹ️ <code>{chat_id}</code> уже в списке.", parse_mode="HTML")
-        track_sent(chat_id_self, m)
-        return
-
-    EXTRA_TARGETS.append(chat_id)
-    logger.info(f"Добавлен получатель: {chat_id}")
+    user.targets.append(target)
 
     test_ok = True
     try:
         tm = await context.bot.send_message(
-            chat_id=chat_id,
+            chat_id=target,
             text="🔔 Вас добавили в список получателей постов X Scroller.",
         )
-        track_sent(chat_id, tm)
+        track_sent(target, tm)
     except Exception as e:
         test_ok = False
-        logger.warning(f"Не удалось отправить тестовое сообщение {chat_id}: {e}")
+        logger.warning(f"Не доставили {target}: {e}")
 
     if test_ok:
         m = await update.message.reply_text(
-            f"✅ Получатель добавлен: <code>{chat_id}</code>\n"
-            f"📨 Проверочное сообщение отправлено.\n\n"
-            f"Всего получателей: <b>{len(EXTRA_TARGETS)}</b>",
+            f"✅ Добавлен: <code>{target}</code>\n"
+            f"Всего: <b>{len(user.targets)}</b>",
             parse_mode="HTML"
         )
     else:
         m = await update.message.reply_text(
-            f"⚠️ Получатель <code>{chat_id}</code> добавлен, "
-            f"но бот <b>не смог ему написать</b>.\n"
-            f"Попросите его нажать <b>Start</b> в боте.",
+            f"⚠️ Добавлен <code>{target}</code>, но бот не смог написать.\n"
+            f"Попросите получателя нажать Start в боте.",
             parse_mode="HTML"
         )
     track_sent(chat_id_self, m)
 
 
 async def list_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    if not EXTRA_TARGETS:
-        m = await update.message.reply_text(
-            "📭 Дополнительных получателей нет.\n\nДобавьте через /add_target.",
-            parse_mode="HTML"
-        )
+    if not is_allowed(user_id):
+        return
+    user = get_user(user_id)
+
+    if not user.targets:
+        m = await update.message.reply_text("📭 У вас нет дополнительных получателей.")
         track_sent(chat_id, m)
         return
 
     lines = [
-        "📨 <b>Дополнительные получатели</b>",
+        "📨 <b>Ваши получатели</b>",
         "━━━━━━━━━━━━━━━━━━━━━",
-        f"👑 Владелец: <code>{ALLOWED_USER_ID}</code> (всегда)",
+        f"👑 Вы: <code>{user_id}</code> (всегда)",
     ]
-    for i, cid in enumerate(EXTRA_TARGETS, 1):
+    for i, cid in enumerate(user.targets, 1):
         lines.append(f"{i}. <code>{cid}</code>")
-    lines.append("")
-    lines.append("<i>Убрать: /remove_target &lt;chat_id&gt;</i>")
 
     m = await update.message.reply_text("\n".join(lines), parse_mode="HTML")
     track_sent(chat_id, m)
 
 
 async def remove_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    if not is_allowed(user_id):
+        return
+    user = get_user(user_id)
+
     if not context.args or not context.args[0].lstrip("-").isdigit():
-        m = await update.message.reply_text(
-            "❌ Использование: <code>/remove_target &lt;chat_id&gt;</code>",
-            parse_mode="HTML"
-        )
+        m = await update.message.reply_text("❌ <code>/remove_target &lt;chat_id&gt;</code>", parse_mode="HTML")
         track_sent(chat_id, m)
         return
 
     target = int(context.args[0])
-    if target not in EXTRA_TARGETS:
-        m = await update.message.reply_text(
-            f"🤷 <code>{target}</code> нет в списке.",
-            parse_mode="HTML"
-        )
+    if target not in user.targets:
+        m = await update.message.reply_text(f"🤷 <code>{target}</code> нет в списке.", parse_mode="HTML")
         track_sent(chat_id, m)
         return
 
-    EXTRA_TARGETS.remove(target)
-    logger.info(f"Удалён получатель: {target}")
-
-    m = await update.message.reply_text(
-        f"🗑 Получатель удалён: <code>{target}</code>\n"
-        f"Осталось получателей: <b>{len(EXTRA_TARGETS)}</b>",
-        parse_mode="HTML"
-    )
+    user.targets.remove(target)
+    m = await update.message.reply_text(f"🗑 Удалён: <code>{target}</code>", parse_mode="HTML")
     track_sent(chat_id, m)
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    if _search_active:
-        stop_event.set()
-        m = await update.message.reply_text("⏹ Останавливаю поиск…")
+    if not is_allowed(user_id):
+        return
+    user = get_user(user_id)
+
+    if user.search_active:
+        user.stop_event.set()
+        m = await update.message.reply_text("⏹ Останавливаю ваш поиск…")
     else:
-        m = await update.message.reply_text("🤷 Сейчас нечего останавливать.")
+        m = await update.message.reply_text("🤷 У вас сейчас нет активного поиска.")
     track_sent(chat_id, m)
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет все сообщения, отправленные ботом в этом чате, и чистит temp_images."""
-    if update.effective_user.id != ALLOWED_USER_ID:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not is_allowed(user_id):
         return
 
-    chat_id = update.effective_chat.id
     ids = SENT_MESSAGES.pop(chat_id, [])
 
     if not ids:
         m = await update.message.reply_text(
-            "🤷 Нечего удалять.\n\n"
-            "<i>Список трекается только с момента запуска бота.</i>",
-            parse_mode="HTML"
+            "🤷 Нечего удалять. Список ведётся с момента запуска бота."
         )
         track_sent(chat_id, m)
         return
@@ -698,91 +881,70 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             deleted += 1
-        except Exception as e:
-            failed += 1
-            logger.debug(f"Не удалось удалить {mid}: {e}")
-        await asyncio.sleep(0.05)
-
-    files_removed = 0
-    for f in TEMP_DIR.glob("*"):
-        try:
-            if f.is_file():
-                f.unlink()
-                files_removed += 1
         except Exception:
-            pass
+            failed += 1
+        await asyncio.sleep(0.05)
 
     m = await context.bot.send_message(
         chat_id=chat_id,
         text=(
             "🗑 <b>Очистка завершена</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📨 Удалено сообщений: <b>{deleted}</b>\n"
-            f"⚠️ Не удалось удалить: <b>{failed}</b>\n"
-            f"📁 Удалено файлов: <b>{files_removed}</b>\n\n"
-            "<i>Сообщения старше 48 часов Telegram не даёт удалять боту.</i>"
+            f"📨 Удалено: <b>{deleted}</b>\n"
+            f"⚠️ Не удалено: <b>{failed}</b>"
         ),
         parse_mode="HTML"
     )
     track_sent(chat_id, m)
 
 
-async def clear_dedup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбрасывает память дедупликации."""
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-
-    chat_id = update.effective_chat.id
-    count = len(SENT_TWEETS)
-    SENT_TWEETS.clear()
-
-    m = await update.message.reply_text(
-        f"♻️ <b>Дедупликация сброшена</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Было удалено записей: <b>{count}</b>\n\n"
-        f"<i>Теперь все посты будут отправляться заново, даже если "
-        f"уже присылались.</i>",
-        parse_mode="HTML"
-    )
-    track_sent(chat_id, m)
-
-
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if not is_allowed(user_id):
+        m = await update.message.reply_text("⛔ Доступ ограничен.")
+        track_sent(chat_id, m)
         return
 
-    chat_id_self = update.effective_chat.id
+    user = get_user(user_id, update.effective_user.username or "")
 
-    if _search_active:
-        m = await update.message.reply_text("⚠️ Поиск уже идёт. Дождитесь или /stop.")
-        track_sent(chat_id_self, m)
+    # Проверка: есть ли у пользователя свой X-аккаунт
+    if not await user_has_active_x_account(user):
+        m = await update.message.reply_text(X_ACCOUNT_HELP, parse_mode="HTML")
+        track_sent(chat_id, m)
+        return
+
+    if user.search_active:
+        m = await update.message.reply_text("⚠️ У вас уже идёт поиск. /stop чтобы прервать.")
+        track_sent(chat_id, m)
         return
 
     if not context.args:
         m = await update.message.reply_text(
-            "❌ Укажите теги.\n"
-            "<b>Пример:</b> <code>/search arknights,nsfw type:photo n-5 lang:en</code>",
+            "❌ Укажите теги. Пример:\n"
+            "<code>/search arknights type:photo n-5 lang:en</code>",
             parse_mode="HTML"
         )
-        track_sent(chat_id_self, m)
+        track_sent(chat_id, m)
         return
 
     groups, exclude, limit, lang, media_type = parse_search_args(context.args)
 
     if not groups:
-        m = await update.message.reply_text(
-            "❌ Не нашёл теги. Проверьте формат:\n"
-            "<code>/search &lt;теги&gt; [-искл] [n-N] [lang:xx] [type:T]</code>",
-            parse_mode="HTML"
-        )
-        track_sent(chat_id_self, m)
+        m = await update.message.reply_text("❌ Не нашёл теги. Проверьте формат.")
+        track_sent(chat_id, m)
         return
 
-    lang_display = lang if lang else "любой"
-    exclude_display = ", ".join(exclude) if exclude else "—"
+    user.search_active = True
+    user.stop_event.clear()
+    user.total_searches += 1
+
     tags_display = format_groups_for_display(groups)
-    targets_info = (
-        f"👑 + {len(EXTRA_TARGETS)} 👥" if EXTRA_TARGETS else "👑 только вы"
+    exclude_display = ", ".join(exclude) if exclude else "—"
+    targets_info = f"👑 + {len(user.targets)} 👥" if user.targets else "👑 только вы"
+    dedup_state = (
+        f"🟢 вкл ({len(user.sent_tweets)} зап.)"
+        if user.dedup_enabled else "🔴 выкл"
     )
 
     header = (
@@ -791,160 +953,131 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 <b>Теги:</b> <code>{esc(tags_display)}</code>\n"
         f"🚫 <b>Исключить:</b> <code>{esc(exclude_display)}</code>\n"
         f"{media_type_icon(media_type)} <b>Тип:</b> <code>{media_type or 'any'}</code>\n"
-        f"🌐 <b>Язык:</b> <code>{esc(lang_display)}</code>\n"
+        f"🌐 <b>Язык:</b> <code>{esc(lang or 'любой')}</code>\n"
         f"📊 <b>Лимит:</b> <code>{limit}</code>\n"
         f"📨 <b>Получатели:</b> {targets_info}\n"
-        f"♻️ <b>Дед.</b> {len(SENT_TWEETS)} записей"
+        f"♻️ <b>Дед.:</b> {dedup_state}"
     )
     msg = await update.message.reply_text(header, parse_mode="HTML")
-    track_sent(chat_id_self, msg)
+    track_sent(chat_id, msg)
 
     asyncio.create_task(
-        _do_search(msg, context, groups, exclude, limit, lang, media_type)
+        _do_search(user, chat_id, msg, context, groups, exclude, limit, lang, media_type)
     )
 
 
-async def _do_search(msg, context, groups, exclude, limit, lang, media_type):
-    global _search_active
-
-    stop_event.clear()
-    _search_active = True
-
+async def _do_search(user: UserState, chat_id: int, msg,
+                     context: ContextTypes.DEFAULT_TYPE,
+                     groups, exclude, limit, lang, media_type):
     try:
         group_strs = []
         for g in groups:
-            if len(g) == 1:
-                group_strs.append(g[0])
-            else:
-                group_strs.append("(" + " ".join(g) + ")")
+            group_strs.append(g[0] if len(g) == 1 else "(" + " ".join(g) + ")")
 
         include_part = " OR ".join(group_strs)
-        query_parts = [f"({include_part})"]
-        for word in exclude:
-            query_parts.append(f"-{word}")
-
-        # filter:images отсекает посты без медиа
-        # Для type:text — не добавляем, чтобы получить и текстовые
+        parts = [f"({include_part})"]
+        for w in exclude:
+            parts.append(f"-{w}")
         if media_type in (None, "any", "photo", "video", "gif"):
-            query_parts.append("filter:images")
-
+            parts.append("filter:images")
         if lang:
-            query_parts.append(f"lang:{lang}")
+            parts.append(f"lang:{lang}")
 
-        full_query = " ".join(query_parts)
-        logger.info(f"Ищу: {full_query} (limit={limit}, type={media_type})")
+        full_query = " ".join(parts)
+        logger.info(f"[u{user.user_id}] query: {full_query} (limit={limit})")
 
-        # Запрашиваем с запасом, т.к. потом отфильтруем по типу и деду
         fetch_limit = min(limit * 3 + len(exclude) * 5, 100)
 
-        tweets = await gather(api.search(full_query, limit=fetch_limit))
-        logger.info(f"twscrape вернул {len(tweets)} постов")
+        # Используем ПЕРСОНАЛЬНЫЙ API пользователя
+        api = get_x_api(user)
+        async with SEARCH_SEMAPHORE:
+            tweets = await gather(api.search(full_query, limit=fetch_limit))
 
-        # Фильтр исключений
+        logger.info(f"[u{user.user_id}] got {len(tweets)} tweets")
+
         if exclude:
-            before = len(tweets)
             tweets = [t for t in tweets if not tweet_has_excluded(t, exclude)]
-            logger.info(f"Фильтр исключений: {before} → {len(tweets)}")
 
-        # Фильтр по типу медиа
         if media_type:
-            before = len(tweets)
             tweets = [t for t in tweets if tweet_matches_media_type(t, media_type)]
-            logger.info(f"Фильтр типа ({media_type}): {before} → {len(tweets)}")
 
-        # Дедупликация
-        before = len(tweets)
-        tweets = [t for t in tweets if not is_already_sent(t.id)]
-        skipped = before - len(tweets)
-        if skipped:
-            logger.info(f"Дедупликация: пропущено {skipped} уже отправленных")
+        skipped = 0
+        if user.dedup_enabled:
+            before = len(tweets)
+            tweets = [t for t in tweets if not is_sent(user, t.id)]
+            skipped = before - len(tweets)
 
-        # Фильтр по языку (клиентский)
         if lang:
-            filtered = []
-            for t in tweets:
-                t_lang = getattr(t, "lang", None)
-                if t_lang is None or t_lang == lang:
-                    filtered.append(t)
-            tweets = filtered
-            logger.info(f"Фильтр языка ({lang}): {len(tweets)}")
+            tweets = [t for t in tweets
+                      if getattr(t, "lang", None) in (None, lang)]
 
-        # Обрезаем до лимита
         if len(tweets) > limit:
             tweets = tweets[:limit]
 
         if not tweets:
-            reasons = []
+            txt = "😕 Ничего не найдено."
             if skipped:
-                reasons.append(f"♻️ пропущено {skipped} уже отправленных")
-            reasons.append("😕 новых подходящих нет")
-            await msg.edit_text(
-                "Ничего не найдено.\n" + "\n".join(reasons),
-                parse_mode="HTML"
-            )
+                txt = f"♻️ Все {skipped} постов уже были отправлены ранее."
+            await msg.edit_text(txt)
             return
 
         total = len(tweets)
-        dedup_info = f"\n♻️ Пропущено уже отправленных: <b>{skipped}</b>" if skipped else ""
+        extra = f"\n♻️ Пропущено (дед.): <b>{skipped}</b>" if skipped else ""
         await msg.edit_text(
-            f"✅ Найдено <b>{total}</b> новых постов.{dedup_info}\n"
+            f"✅ Найдено <b>{total}</b> новых постов.{extra}\n"
             f"📥 Скачиваю картинки…\n\n"
             f"<i>Чтобы остановить — /stop</i>",
             parse_mode="HTML"
         )
+
+        recipients = [user.user_id] + user.targets
 
         total_photos = 0
         processed = 0
         stopped = False
 
         for tweet in tweets:
-            if stop_event.is_set():
+            if user.stop_event.is_set():
                 stopped = True
                 break
-
-            count = await download_tweet_media(tweet, context)
-            total_photos += count
+            cnt = await download_tweet_media(tweet, context, recipients)
+            total_photos += cnt
             processed += 1
-
-            # Помечаем как отправленный ТОЛЬКО если реально что-то отправилось
-            if count > 0:
-                mark_sent(tweet.id)
+            if cnt > 0:
+                mark_sent(user, tweet.id)
+                user.total_posts += 1
 
             if processed % 5 == 0 and processed < total:
                 try:
                     await msg.edit_text(
-                        f"📥 <b>Прогресс:</b> {processed} / {total}\n"
-                        f"🖼 Скачано картинок: <b>{total_photos}</b>\n"
-                        f"♻️ В памяти дед.: <b>{len(SENT_TWEETS)}</b>\n\n"
-                        f"<i>Чтобы остановить — /stop</i>",
+                        f"📥 <b>Прогресс:</b> {processed}/{total}\n"
+                        f"🖼 Картинок: <b>{total_photos}</b>\n"
+                        f"♻️ В дедупе: <b>{len(user.sent_tweets)}</b>\n\n"
+                        f"<i>/stop чтобы прервать</i>",
                         parse_mode="HTML"
                     )
                 except Exception:
                     pass
-
             await asyncio.sleep(1.5)
 
+        tail = (
+            f"📥 Обработано: <b>{processed}</b>/{total}\n"
+            f"🖼 Картинок: <b>{total_photos}</b>\n"
+            f"♻️ В дедупе: <b>{len(user.sent_tweets)}</b>"
+        )
         if stopped:
             await msg.edit_text(
-                "⏹ <b>Остановлено пользователем</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📥 Обработано постов: <b>{processed}</b> / {total}\n"
-                f"🖼 Скачано картинок: <b>{total_photos}</b>\n"
-                f"♻️ В памяти дед.: <b>{len(SENT_TWEETS)}</b>",
+                "⏹ <b>Остановлено вами</b>\n━━━━━━━━━━━━━━━━━━━━━\n" + tail,
                 parse_mode="HTML"
             )
         else:
             await msg.edit_text(
-                "✅ <b>Готово!</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📥 Обработано постов: <b>{total}</b>\n"
-                f"🖼 Скачано картинок: <b>{total_photos}</b>\n"
-                f"♻️ В памяти дед.: <b>{len(SENT_TWEETS)}</b>",
+                "✅ <b>Готово!</b>\n━━━━━━━━━━━━━━━━━━━━━\n" + tail,
                 parse_mode="HTML"
             )
 
     except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
+        logger.error(f"[u{user.user_id}] search error: {e}")
         try:
             await msg.edit_text(
                 f"❌ Ошибка: <code>{esc(str(e)[:200])}</code>",
@@ -953,8 +1086,8 @@ async def _do_search(msg, context, groups, exclude, limit, lang, media_type):
         except Exception:
             pass
     finally:
-        _search_active = False
-        stop_event.clear()
+        user.search_active = False
+        user.stop_event.clear()
 
 
 # ---- Веб-сервер ----
@@ -971,7 +1104,7 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Веб-сервер для Render запущен на порту {port}")
+    logger.info(f"Web server on port {port}")
 
 
 # ---- Запуск ----
@@ -987,11 +1120,13 @@ async def run_bot():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("my_id", my_id))
+    application.add_handler(CommandHandler("my_status", my_status))
     application.add_handler(CommandHandler("add_account", add_account))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("clear", clear))
+    application.add_handler(CommandHandler("dedup", dedup_cmd))
     application.add_handler(CommandHandler("clear_dedup", clear_dedup))
     application.add_handler(CommandHandler("add_target", add_target))
     application.add_handler(CommandHandler("targets", list_targets))
@@ -1001,10 +1136,11 @@ async def run_bot():
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-    await ensure_account()
-    load_targets_from_env()
+    await ensure_owner_account()
 
-    logger.info("Telegram-бот запущен.")
+    get_user(OWNER_USER_ID, "owner")
+
+    logger.info("Bot started. Multi-user mode.")
 
     try:
         await asyncio.Event().wait()
@@ -1017,25 +1153,24 @@ async def run_bot():
 async def main_async():
     global http_session
     http_session = aiohttp.ClientSession()
-
     try:
         await asyncio.gather(
             start_web_server(),
             run_bot(),
             dedup_cleanup_loop(),
+            user_cleanup_loop(),
         )
     finally:
         await http_session.close()
 
 
 if __name__ == "__main__":
-    print("=== СТАРТ ===", flush=True)
-    print("BOT_TOKEN задан:", bool(BOT_TOKEN), flush=True)
-    print("ALLOWED_USER_ID:", ALLOWED_USER_ID, flush=True)
-    print("PORT:", os.environ.get("PORT"), flush=True)
+    print("=== START ===", flush=True)
+    print("BOT_TOKEN set:", bool(BOT_TOKEN), flush=True)
+    print("OWNER_USER_ID:", OWNER_USER_ID, flush=True)
 
     if not BOT_TOKEN:
-        logger.error("Укажите BOT_TOKEN в переменных окружения!")
+        logger.error("BOT_TOKEN не задан!")
     else:
         try:
             asyncio.run(main_async())
