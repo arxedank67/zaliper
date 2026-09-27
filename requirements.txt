@@ -1,0 +1,4 @@
+python-telegram-bot==21.0.1
+twscrape
+aiohttp
+python-dotenv
