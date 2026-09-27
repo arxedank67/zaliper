@@ -1,5 +1,6 @@
 import os
 import asyncio
+import html
 import logging
 from pathlib import Path
 
@@ -28,15 +29,22 @@ logger = logging.getLogger(__name__)
 # --- Инициализация API twscrape ---
 api = API("accounts.db")
 
-# Общая aiohttp-сессия для скачивания картинок
+# Глобальный флаг остановки поиска
+stop_event = asyncio.Event()
+
+# Общая aiohttp-сессия
 http_session: aiohttp.ClientSession | None = None
 
-# User-Agent, чтобы Twitter не блокировал скачивание картинок с Render
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/120.0.0.0 Safari/537.36"
 }
+
+
+def esc(s: str) -> str:
+    """Экранирует спецсимволы HTML в пользовательском тексте."""
+    return html.escape(s or "")
 
 
 # --- Вспомогательные функции ---
@@ -58,17 +66,12 @@ async def add_twitter_account(auth_token: str, ct0: str):
 async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE):
     """Скачивает все картинки из твита и отправляет их в Telegram."""
     media_list = tweet.media
-
     if not media_list:
-        logger.info(f"[DEBUG] Твит {tweet.id}: media_list пустой")
         return 0
 
     photos = getattr(media_list, "photos", None)
     if not photos:
-        logger.info(f"[DEBUG] Твит {tweet.id}: photos пустой или отсутствует")
         return 0
-
-    logger.info(f"[DEBUG] Твит {tweet.id}: найдено {len(photos)} фото")
 
     photos_to_send = []
     for i, photo in enumerate(photos[:10]):
@@ -78,42 +81,37 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
             if pid:
                 url = f"https://pbs.twimg.com/media/{pid}.jpg"
         if not url:
-            logger.warning(f"[DEBUG] Твит {tweet.id}, фото {i}: нет URL и id")
             continue
 
-        logger.info(f"[DEBUG] Пытаюсь скачать: {url}")
         file_path = TEMP_DIR / f"{tweet.id}_{i}.jpg"
-
         try:
-            # Используем собственную aiohttp-сессию, а не bot.session
             async with http_session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
                     with open(file_path, "wb") as f:
                         f.write(await resp.read())
                     photos_to_send.append(file_path)
-                    logger.info(f"[DEBUG] Успешно скачано: {file_path}")
                 else:
                     logger.error(f"[DEBUG] HTTP {resp.status} при скачивании {url}")
         except Exception as e:
             logger.error(f"[DEBUG] Исключение при скачивании {url}: {e}")
 
     if not photos_to_send:
-        logger.warning(f"[DEBUG] Твит {tweet.id}: ни одна картинка не скачалась")
         return 0
 
-    try:
-        caption = (
-            f"🔗 [Ссылка на пост](https://x.com/i/status/{tweet.id})\n"
-            f"📝 {tweet.rawContent[:200]}"
-        )
+    text_preview = esc(tweet.rawContent[:180]) if tweet.rawContent else ""
+    caption = (
+        f'🔗 <a href="https://x.com/i/status/{tweet.id}">Ссылка на пост</a>\n'
+        f'📝 <i>{text_preview}</i>'
+    )
 
+    try:
         if len(photos_to_send) == 1:
             with open(photos_to_send[0], "rb") as f:
                 await context.bot.send_photo(
                     chat_id=ALLOWED_USER_ID,
                     photo=f,
                     caption=caption,
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
         else:
             media_group = []
@@ -126,7 +124,7 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
             await context.bot.send_message(
                 chat_id=ALLOWED_USER_ID,
                 text=caption,
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
     except Exception as e:
         logger.error(f"Ошибка отправки в Telegram: {e}")
@@ -137,23 +135,83 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
     return len(photos_to_send)
 
 
+# --- Парсер аргументов поиска ---
+
+def parse_search_args(args: list) -> tuple[list, int, str | None]:
+    """Разбирает аргументы /search.
+
+    Поддерживает:
+      /search Arknights                       → tags, limit=20, lang=None
+      /search Arknights n-10                  → tags, limit=10
+      /search Arknights lang:en               → tags, lang="en"
+      /search Arknights n-15 lang:ru          → tags, limit=15, lang="ru"
+
+    Возвращает: (tags, limit, lang)
+    """
+    tags = []
+    limit = 20
+    lang = None
+
+    for raw in args:
+        arg = raw.strip().rstrip(",")
+        if not arg:
+            continue
+
+        # n-<число>
+        if arg.startswith("n-") and arg[2:].isdigit():
+            limit = max(1, min(100, int(arg[2:])))
+            continue
+
+        # lang:xx или lang-xx
+        if arg.startswith("lang:") or arg.startswith("lang-"):
+            code = arg.split(":", 1)[1] if ":" in arg else arg.split("-", 1)[1]
+            code = code.strip().lower()
+            if 2 <= len(code) <= 5:
+                lang = code
+            continue
+
+        tags.append(arg)
+
+    return tags, limit, lang
+
+
 # --- Обработчики команд Telegram ---
+
+HELP_TEXT = (
+    "🤖 <b>X Scroller Bot</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "📌 <b>Команды</b>\n\n"
+    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[n-N]</code> <code>[lang:xx]</code>\n"
+    "   Поиск постов с картинками\n"
+    "   <i>Примеры:</i>\n"
+    "   • <code>/search Arknights</code>\n"
+    "   • <code>/search Arknights n-10</code>\n"
+    "   • <code>/search Arknights n-10 lang:en</code>\n"
+    "   • <code>/search Zone-tan, Paimon n-5</code>\n\n"
+    "⏹ <b>/stop</b> — прервать текущий поиск\n"
+    "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code> — добавить аккаунт X\n"
+    "📊 <b>/status</b> — статус аккаунтов X\n"
+    "❓ <b>/help</b> — это меню\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "💡 <i>Параметры поиска:</i>\n"
+    "• <code>n-N</code> — сколько постов искать (1–100)\n"
+    "• <code>lang:xx</code> — язык постов (en, ru, ja, ko…)\n"
+)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start."""
     if update.effective_user.id != ALLOWED_USER_ID:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
-    await update.message.reply_text(
-        "👋 Привет! Я бот для поиска постов в X.\n\n"
-        "**Команды:**\n"
-        "`/search <теги>` — Найти посты по тегам\n"
-        "`/add_account <auth_token> <ct0>` — Добавить аккаунт X\n"
-        "`/status` — Проверить статус аккаунтов X\n"
-        "`/help` — Показать это сообщение",
-        parse_mode="Markdown"
-    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает справку."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 
 async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -164,12 +222,13 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "❌ Использование: `/add_account <auth_token> <ct0>`\n\n"
-            "Как получить cookies:\n"
+            "❌ <b>Использование:</b>\n"
+            "<code>/add_account &lt;auth_token&gt; &lt;ct0&gt;</code>\n\n"
+            "<b>Как получить cookies:</b>\n"
             "1. Откройте x.com в браузере\n"
             "2. F12 → Application → Cookies → https://x.com\n"
-            "3. Скопируйте значения `auth_token` и `ct0`",
-            parse_mode="Markdown"
+            "3. Скопируйте значения <code>auth_token</code> и <code>ct0</code>",
+            parse_mode="HTML"
         )
         return
 
@@ -177,7 +236,7 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await add_twitter_account(auth_token, ct0)
 
     if success:
-        await update.message.reply_text("✅ Аккаунт X успешно добавлен!")
+        await update.message.reply_text("✅ Аккаунт X успешно добавлен.")
     else:
         await update.message.reply_text("❌ Не удалось добавить аккаунт. Проверьте логи.")
 
@@ -192,65 +251,167 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Нет добавленных аккаунтов X.")
         return
 
-    text = "📊 **Статус аккаунтов:**\n"
+    lines = ["📊 <b>Статус аккаунтов</b>", "━━━━━━━━━━━━━━━━━━━━━"]
     for acc in accounts:
-        # accounts_info возвращает список словарей, а не объектов
         username = acc.get("username", "unknown")
         is_active = acc.get("active", False)
-        text += f"• `{username}` — {'✅ активен' if is_active else '❌ неактивен'}\n"
+        icon = "✅" if is_active else "❌"
+        lines.append(f"{icon} <code>{esc(username)}</code>")
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Прерывает текущий поиск."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    if not stop_event.is_set():
+        # Проверим, идёт ли вообще поиск
+        if stop_event._value is False and _search_in_progress():
+            stop_event.set()
+            await update.message.reply_text("⏹ Останавливаю поиск…")
+        else:
+            await update.message.reply_text("🤷 Сейчас нечего останавливать.")
+    else:
+        await update.message.reply_text("⏹ Уже останавливаю.")
+
+
+# Простой флаг, чтобы понимать, идёт ли поиск
+_search_active = False
+
+def _search_in_progress() -> bool:
+    return _search_active
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск постов по тегам."""
+    global _search_active
+
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
     if not context.args:
         await update.message.reply_text(
-            "❌ Укажите теги через запятую.\n"
-            "Пример: `/search Zone-tan, #GenshinImpact`",
-            parse_mode="Markdown"
+            "❌ Укажите теги.\n"
+            "<b>Пример:</b> <code>/search Arknights n-10 lang:en</code>",
+            parse_mode="HTML"
         )
         return
 
-    query = " OR ".join(context.args)
-    full_query = f"({query}) filter:images"
+    tags, limit, lang = parse_search_args(context.args)
 
-    msg = await update.message.reply_text(
-        f"🔍 Ищу посты: `{query}`...", parse_mode="Markdown"
+    if not tags:
+        await update.message.reply_text(
+            "❌ Не нашёл теги. Проверьте формат:\n"
+            "<code>/search &lt;теги&gt; [n-N] [lang:xx]</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # Сбрасываем флаг остановки
+    stop_event.clear()
+    _search_active = True
+
+    query = " OR ".join(tags)
+    full_query = f"({query}) filter:images"
+    if lang:
+        full_query += f" lang:{lang}"
+
+    lang_display = lang if lang else "любой"
+    header = (
+        "🔍 <b>Поиск запущен</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 <b>Теги:</b> <code>{esc(', '.join(tags))}</code>\n"
+        f"🌐 <b>Язык:</b> <code>{esc(lang_display)}</code>\n"
+        f"📊 <b>Лимит:</b> <code>{limit}</code>"
     )
+    msg = await update.message.reply_text(header, parse_mode="HTML")
 
     try:
-        tweets = await gather(api.search(full_query, limit=20))
+        tweets = await gather(api.search(full_query, limit=limit))
 
         if not tweets:
             await msg.edit_text("😕 Ничего не найдено по этим тегам.")
             return
 
+        # Клиентская фильтрация по языку (на случай, если Twitter вернул не то)
+        if lang:
+            filtered = []
+            for t in tweets:
+                t_lang = getattr(t, "lang", None)
+                if t_lang is None or t_lang == lang:
+                    filtered.append(t)
+            tweets = filtered
+
+            if not tweets:
+                await msg.edit_text(
+                    "😕 Ничего не найдено после фильтра по языку. "
+                    "Попробуйте убрать <code>lang:xx</code>.",
+                    parse_mode="HTML"
+                )
+                return
+
+        total = len(tweets)
         await msg.edit_text(
-            f"✅ Найдено {len(tweets)} постов. Начинаю скачивать картинки..."
+            f"✅ Найдено <b>{total}</b> постов.\n"
+            f"📥 Скачиваю картинки…\n\n"
+            f"<i>Чтобы остановить — отправьте</i> /stop",
+            parse_mode="HTML"
         )
 
         total_photos = 0
+        processed = 0
+        stopped = False
+
         for tweet in tweets:
+            # Проверяем /stop перед каждым постом
+            if stop_event.is_set():
+                stopped = True
+                break
+
             count = await download_tweet_media(tweet, context)
             total_photos += count
+            processed += 1
+
+            # Обновляем прогресс каждые 5 постов
+            if processed % 5 == 0 and processed < total:
+                try:
+                    await msg.edit_text(
+                        f"📥 <b>Прогресс:</b> {processed} / {total}\n"
+                        f"🖼 Скачано картинок: <b>{total_photos}</b>\n\n"
+                        f"<i>Чтобы остановить — /stop</i>",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass  # Telegram иногда ругается на слишком частые edit
+
             await asyncio.sleep(1.5)
 
-        await msg.edit_text(
-            f"✅ Готово! Скачано {total_photos} картинок из {len(tweets)} постов."
-        )
+        # Финальное сообщение
+        if stopped:
+            await msg.edit_text(
+                "⏹ <b>Остановлено пользователем</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 Обработано постов: <b>{processed}</b> / {total}\n"
+                f"🖼 Скачано картинок: <b>{total_photos}</b>",
+                parse_mode="HTML"
+            )
+        else:
+            await msg.edit_text(
+                "✅ <b>Готово!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 Обработано постов: <b>{total}</b>\n"
+                f"🖼 Скачано картинок: <b>{total_photos}</b>",
+                parse_mode="HTML"
+            )
 
     except Exception as e:
         logger.error(f"Ошибка поиска: {e}")
-        await msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает справку."""
-    await start(update, context)
+        await msg.edit_text(f"❌ Ошибка: <code>{esc(str(e)[:200])}</code>", parse_mode="HTML")
+    finally:
+        _search_active = False
+        stop_event.clear()
 
 
 # --- Веб-сервер для Render ---
@@ -283,6 +444,7 @@ async def run_bot():
     application.add_handler(CommandHandler("add_account", add_account))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
+    application.add_handler(CommandHandler("stop", stop))
 
     await application.initialize()
     await application.start()
