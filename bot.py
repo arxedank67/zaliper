@@ -26,17 +26,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Инициализация API twscrape ---
 api = API("accounts.db")
 
-# Флаги для управления поиском
 stop_event = asyncio.Event()
 _search_active = False
-
-# Дополнительные получатели (кроме владельца)
 EXTRA_TARGETS: list[int] = []
 
-# Общая aiohttp-сессия
 http_session: aiohttp.ClientSession | None = None
 
 HEADERS = {
@@ -51,7 +46,6 @@ def esc(s: str) -> str:
 
 
 def load_targets_from_env():
-    """Загружает дополнительные chat_id из переменной окружения TARGET_CHAT_IDS."""
     raw = os.environ.get("TARGET_CHAT_IDS", "").strip()
     if not raw:
         return
@@ -65,10 +59,9 @@ def load_targets_from_env():
         logger.info(f"Загружено получателей из env: {EXTRA_TARGETS}")
 
 
-# --- Вспомогательные функции ---
+# --- Twitter helpers ---
 
 async def add_twitter_account(auth_token: str, ct0: str):
-    """Добавляет аккаунт X в пул twscrape."""
     try:
         await api.pool.add_account_cookies(
             "main_account",
@@ -82,7 +75,6 @@ async def add_twitter_account(auth_token: str, ct0: str):
 
 
 async def ensure_account():
-    """Проверяет, есть ли аккаунт X. Если нет — восстанавливает из env."""
     try:
         accounts = await api.pool.accounts_info()
         if accounts and any(acc.get("active") for acc in accounts):
@@ -94,18 +86,17 @@ async def ensure_account():
     auth = os.environ.get("X_AUTH_TOKEN")
     ct0 = os.environ.get("X_CT0")
     if auth and ct0:
-        logger.info("Аккаунт не найден, восстанавливаю из переменных окружения…")
+        logger.info("Аккаунт не найден, восстанавливаю из env…")
         await add_twitter_account(auth, ct0)
     else:
         logger.warning(
             "Аккаунт X не найден. Добавьте через /add_account "
-            "или задайте X_AUTH_TOKEN + X_CT0 в переменных окружения Render."
+            "или задайте X_AUTH_TOKEN + X_CT0."
         )
 
 
 async def send_tweet_to(chat_id: int, photos_to_send: list, caption: str,
                         context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет один пост одному получателю."""
     if len(photos_to_send) == 1:
         with open(photos_to_send[0], "rb") as f:
             await context.bot.send_photo(
@@ -128,7 +119,6 @@ async def send_tweet_to(chat_id: int, photos_to_send: list, caption: str,
 
 
 async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE):
-    """Скачивает все картинки из твита и рассылает их владельцу и доп. получателям."""
     media_list = tweet.media
     if not media_list:
         return 0
@@ -155,7 +145,7 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
                         f.write(await resp.read())
                     photos_to_send.append(file_path)
                 else:
-                    logger.error(f"[DEBUG] HTTP {resp.status} при скачивании {url}")
+                    logger.error(f"[DEBUG] HTTP {resp.status} для {url}")
         except Exception as e:
             logger.error(f"[DEBUG] Исключение при скачивании {url}: {e}")
 
@@ -170,30 +160,23 @@ async def download_tweet_media(tweet: Tweet, context: ContextTypes.DEFAULT_TYPE)
 
     recipients = [ALLOWED_USER_ID] + EXTRA_TARGETS
 
-    try:
-        for chat_id in recipients:
-            try:
-                await send_tweet_to(chat_id, photos_to_send, caption, context)
-                # Небольшая пауза между получателями, чтобы не ловить rate limit
-                if len(recipients) > 1:
-                    await asyncio.sleep(0.7)
-            except Exception as e:
-                logger.error(f"Ошибка отправки в {chat_id}: {e}")
-    finally:
-        for path in photos_to_send:
-            path.unlink(missing_ok=True)
+    for chat_id in recipients:
+        try:
+            await send_tweet_to(chat_id, photos_to_send, caption, context)
+            if len(recipients) > 1:
+                await asyncio.sleep(0.7)
+        except Exception as e:
+            logger.error(f"Ошибка отправки в {chat_id}: {e}")
+
+    for path in photos_to_send:
+        path.unlink(missing_ok=True)
 
     return len(photos_to_send)
 
 
-def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
-    """Разбирает аргументы /search.
+# --- Парсер ---
 
-    Логика групп:
-      - Теги через ЗАПЯТУЮ (apple,sun) — AND: все слова должны быть в посте.
-      - Разные аргументы через ПРОБЕЛ (apple sun) — OR: достаточно одного.
-      - Слова с минусом (-nsfw) — исключение.
-    """
+def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
     include_groups = []
     exclude = []
     limit = 20
@@ -230,7 +213,6 @@ def parse_search_args(args: list) -> tuple[list, list, int, str | None]:
 
 
 def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
-    """Клиентская страховка: проверяет исключаемые слова."""
     if not exclude:
         return False
     text = (tweet.rawContent or "").lower()
@@ -242,7 +224,6 @@ def tweet_has_excluded(tweet: Tweet, exclude: list) -> bool:
 
 
 def format_groups_for_display(groups: list) -> str:
-    """Красиво показывает группы: apple + sun | banana."""
     parts = []
     for g in groups:
         if len(g) == 1:
@@ -252,74 +233,103 @@ def format_groups_for_display(groups: list) -> str:
     return "  |  ".join(parts)
 
 
-def extract_chat_id_from_forward(message) -> int | None:
-    """Извлекает chat_id из пересланного сообщения."""
+def extract_chat_id_from_forward(message) -> tuple[int | None, str]:
+    """Возвращает (chat_id, описание_проблемы)."""
     origin = getattr(message, "forward_origin", None)
     if not origin:
-        return None
+        return None, "Сообщение не переслано."
 
-    # MessageOriginUser
+    # Определяем тип origin
+    origin_type = origin.__class__.__name__
+    logger.info(f"forward_origin type: {origin_type}")
+
+    # MessageOriginUser — пересылка от обычного пользователя
     sender_user = getattr(origin, "sender_user", None)
     if sender_user:
-        return sender_user.id
+        if getattr(sender_user, "is_bot", False):
+            return None, (
+                "Это сообщение переслано от <b>бота</b>, а не от человека.\n\n"
+                "Перешли сообщение <u>от получателя</u>, а не мой ответ ему."
+            )
+        return sender_user.id, ""
 
-    # MessageOriginChat
+    # MessageOriginHiddenUser — пользователь скрыл свои пересылки
+    if origin_type == "MessageOriginHiddenUser":
+        return None, (
+            "Получатель <b>скрыл пересылку</b> своих сообщений.\n\n"
+            "Попросите его прислать вам его <code>chat_id</code> "
+            "(он может узнать через <code>/my_id</code>) "
+            "и добавьте вручную: <code>/add_target &lt;chat_id&gt;</code>."
+        )
+
+    # MessageOriginChat — пересылка из группы
     sender_chat = getattr(origin, "sender_chat", None)
     if sender_chat:
-        return sender_chat.id
+        return sender_chat.id, ""
 
-    # MessageOriginChannel
+    # MessageOriginChannel — пересылка из канала
     chat = getattr(origin, "chat", None)
     if chat:
-        return chat.id
+        return chat.id, ""
 
-    return None
+    return None, "Не удалось определить отправителя пересланного сообщения."
 
 
-# --- Обработчики команд Telegram ---
+# --- Команды ---
 
-HELP_TEXT = (
+OWNER_HELP = (
     "🤖 <b>X Scroller Bot</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "📌 <b>Команды</b>\n\n"
-    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> <code>[n-N]</code> <code>[lang:xx]</code>\n\n"
-    "   <b>Логика тегов:</b>\n"
+    "🔎 <b>/search</b> <code>&lt;теги&gt;</code> <code>[-искл]</code> <code>[n-N]</code> <code>[lang:xx]</code>\n"
     "   • <code>apple sun</code> → apple <b>ИЛИ</b> sun\n"
-    "   • <code>apple,sun</code> → apple <b>И</b> sun (в одном посте)\n"
-    "   • <code>-nsfw</code> → исключить посты со словом nsfw\n\n"
-    "   <i>Примеры:</i>\n"
-    "   • <code>/search arknights n-10</code>\n"
-    "   • <code>/search arknights,nsfw -guro n-5 lang:en</code>\n\n"
+    "   • <code>apple,sun</code> → apple <b>И</b> sun\n"
+    "   • <code>-nsfw</code> → исключить\n"
+    "   • <code>n-10</code> → лимит 10\n"
+    "   • <code>lang:en</code> → англ. язык\n\n"
     "⏹ <b>/stop</b> — прервать поиск\n\n"
-    "📨 <b>Пересылка контактам:</b>\n"
-    "   <b>/add_target</b> — <i>ответом на пересланное сообщение</i> от контакта,\n"
-    "      либо <code>/add_target &lt;chat_id&gt;</code>\n"
-    "   <b>/targets</b> — список получателей\n"
-    "   <b>/remove_target</b> <code>&lt;chat_id&gt;</code> — убрать получателя\n\n"
+    "📨 <b>Пересылка контактам</b>\n"
+    "   • <b>/add_target</b> — <i>ответом на пересланное сообщение от получателя</i>,\n"
+    "     либо <code>/add_target &lt;chat_id&gt;</code>\n"
+    "   • <b>/targets</b> — список получателей\n"
+    "   • <b>/remove_target</b> <code>&lt;chat_id&gt;</code> — убрать\n\n"
     "👤 <b>/add_account</b> <code>&lt;auth_token&gt; &lt;ct0&gt;</code>\n"
     "📊 <b>/status</b> — статус аккаунтов X\n"
-    "❓ <b>/help</b> — это меню\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "💡 <b>Параметры /search:</b>\n"
-    "• <code>n-N</code> — сколько постов (1–100)\n"
-    "• <code>lang:xx</code> — язык (en, ru, ja, ko…)\n"
-    "• <code>-тег</code> — исключить\n"
-    "• <code>a,b</code> — AND\n"
-    "• <code>a b</code> — OR\n"
+    "❓ <b>/help</b> — это меню\n"
 )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        await update.message.reply_text("⛔ Доступ запрещён.")
+    user_id = update.effective_user.id
+    if user_id == ALLOWED_USER_ID:
+        await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
         return
-    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+
+    # Не владелец — показываем его ID, чтобы он мог сообщить его владельцу
+    await update.message.reply_text(
+        "👋 Привет! Этот бот — <b>приватный</b>.\n\n"
+        f"🆔 Ваш <code>chat_id</code>: <code>{user_id}</code>\n\n"
+        "Передайте его владельцу бота, чтобы получать от него посты.\n"
+        "<i>Команды поиска доступны только владельцу.</i>",
+        parse_mode="HTML"
+    )
+
+
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает chat_id текущего пользователя — доступно всем."""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "—"
+    await update.message.reply_text(
+        f"🆔 Ваш <code>chat_id</code>: <code>{user_id}</code>\n"
+        f"👤 Username: @{esc(username)}",
+        parse_mode="HTML"
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
+        await my_id(update, context)
         return
-    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+    await update.message.reply_text(OWNER_HELP, parse_mode="HTML")
 
 
 async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,12 +346,10 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     auth_token, ct0 = args[0], args[1]
-    success = await add_twitter_account(auth_token, ct0)
-
-    if success:
+    if await add_twitter_account(auth_token, ct0):
         await update.message.reply_text("✅ Аккаунт X успешно добавлен.")
     else:
-        await update.message.reply_text("❌ Не удалось добавить аккаунт. Проверьте логи.")
+        await update.message.reply_text("❌ Не удалось добавить. Проверьте логи.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,26 +371,28 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-# --- Команды управления получателями ---
-
 async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавляет получателя пересылки."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
     chat_id = None
 
-    # Способ 1: ответ на пересланное сообщение от контакта
+    # Способ 1: reply на пересланное сообщение
     if update.message.reply_to_message:
-        chat_id = extract_chat_id_from_forward(update.message.reply_to_message)
+        chat_id, error = extract_chat_id_from_forward(update.message.reply_to_message)
         if chat_id is None:
             await update.message.reply_text(
-                "❌ Это сообщение не является пересланным от пользователя или канала.\n\n"
-                "<b>Как добавить получателя:</b>\n"
-                "1. Попросите контакта написать боту /start (иначе бот не сможет ему писать).\n"
-                "2. Перешлите любое его сообщение мне.\n"
-                "3. Ответьте на пересланное <code>/add_target</code>.\n\n"
-                "<i>Либо укажите chat_id вручную:</i> <code>/add_target &lt;chat_id&gt;</code>",
+                f"❌ {error}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "<b>Как правильно добавить получателя:</b>\n"
+                "1. Попросите контакта открыть бота и нажать <b>Start</b> "
+                "(или отправить <code>/my_id</code>).\n"
+                "2. Получатель узнает свой <code>chat_id</code> и передаст его вам.\n"
+                "3. Добавьте его вручную:\n"
+                "   <code>/add_target &lt;chat_id&gt;</code>\n\n"
+                "<b>Или:</b> попросите получателя переслать вам любое <u>его</u> "
+                "сообщение боту, потом <u>вы</u> перешлите это сообщение мне "
+                "и ответьте на него <code>/add_target</code>.",
                 parse_mode="HTML"
             )
             return
@@ -403,16 +413,17 @@ async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "<b>Как добавить получателя:</b>\n\n"
-            "1. Попросите контакта написать боту /start.\n"
-            "2. Перешлите любое его сообщение мне.\n"
-            "3. Ответьте на пересланное <code>/add_target</code>.\n\n"
-            "<i>Либо укажите chat_id вручную:</i> <code>/add_target &lt;chat_id&gt;</code>",
+            "1. Попросите получателя нажать <b>Start</b> в боте.\n"
+            "2. Он получит свой <code>chat_id</code> и передаст вам.\n"
+            "3. Вы вводите: <code>/add_target &lt;chat_id&gt;</code>\n\n"
+            "<i>Либо</i> — попросите получателя переслать вам его сообщение, "
+            "перешлите его мне и ответьте <code>/add_target</code>.",
             parse_mode="HTML"
         )
         return
 
     if chat_id == ALLOWED_USER_ID:
-        await update.message.reply_text("⚠️ Это ваш собственный chat_id — вы и так получаете посты.")
+        await update.message.reply_text("⚠️ Это ваш собственный ID — вы и так получаете посты.")
         return
 
     if chat_id in EXTRA_TARGETS:
@@ -422,19 +433,36 @@ async def add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     EXTRA_TARGETS.append(chat_id)
     logger.info(f"Добавлен получатель: {chat_id}")
 
-    await update.message.reply_text(
-        f"✅ Получатель добавлен: <code>{chat_id}</code>\n\n"
-        f"📊 Всего получателей: <b>{len(EXTRA_TARGETS)}</b>\n\n"
-        f"<i>⚠️ На Render бесплатного плана список сбросится при "
-        f"следующем деплое. Чтобы сохранить — добавьте переменную "
-        f"окружения</i> <code>TARGET_CHAT_IDS</code> <i>со списком через запятую:</i>\n"
-        f"<code>{','.join(str(x) for x in EXTRA_TARGETS)}</code>",
-        parse_mode="HTML"
-    )
+    # Попробуем отправить получателю проверочное сообщение
+    test_ok = True
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🔔 Вас добавили в список получателей постов X Scroller.",
+        )
+    except Exception as e:
+        test_ok = False
+        logger.warning(f"Не удалось отправить тестовое сообщение {chat_id}: {e}")
+
+    if test_ok:
+        await update.message.reply_text(
+            f"✅ Получатель добавлен: <code>{chat_id}</code>\n"
+            f"📨 Проверочное сообщение отправлено — значит, бот сможет ему писать.\n\n"
+            f"Всего получателей: <b>{len(EXTRA_TARGETS)}</b>",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Получатель <code>{chat_id}</code> добавлен в список, "
+            f"но бот <b>не смог ему написать</b>.\n\n"
+            f"<b>Что делать:</b> попросите получателя открыть бота и нажать "
+            f"<b>Start</b> (или отправить <code>/start</code>). "
+            f"Без этого Telegram запрещает боту писать первым.",
+            parse_mode="HTML"
+        )
 
 
 async def list_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает текущих получателей."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
@@ -461,7 +489,6 @@ async def list_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def remove_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет получателя."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
@@ -491,7 +518,6 @@ async def remove_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Прерывает текущий поиск."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
@@ -503,7 +529,6 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик /search — запускает поиск в фоне."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
@@ -532,7 +557,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang_display = lang if lang else "любой"
     exclude_display = ", ".join(exclude) if exclude else "—"
     tags_display = format_groups_for_display(groups)
-
     targets_info = (
         f"👑 + {len(EXTRA_TARGETS)} 👥" if EXTRA_TARGETS else "👑 только вы"
     )
@@ -552,7 +576,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_search(msg, context, groups, exclude, limit, lang):
-    """Фоновый поиск и скачивание."""
     global _search_active
 
     stop_event.clear()
@@ -567,7 +590,6 @@ async def _do_search(msg, context, groups, exclude, limit, lang):
                 group_strs.append("(" + " ".join(g) + ")")
 
         include_part = " OR ".join(group_strs)
-
         query_parts = [f"({include_part})"]
         for word in exclude:
             query_parts.append(f"-{word}")
@@ -579,13 +601,12 @@ async def _do_search(msg, context, groups, exclude, limit, lang):
         logger.info(f"Ищу: {full_query} (limit={limit})")
 
         fetch_limit = min(limit + len(exclude) * 5, 100)
-
         tweets = await gather(api.search(full_query, limit=fetch_limit))
 
         if exclude:
             before = len(tweets)
             tweets = [t for t in tweets if not tweet_has_excluded(t, exclude)]
-            logger.info(f"Клиентский фильтр исключений: {before} → {len(tweets)}")
+            logger.info(f"Фильтр исключений: {before} → {len(tweets)}")
 
         if len(tweets) > limit:
             tweets = tweets[:limit]
@@ -601,11 +622,9 @@ async def _do_search(msg, context, groups, exclude, limit, lang):
                 if t_lang is None or t_lang == lang:
                     filtered.append(t)
             tweets = filtered
-
             if not tweets:
                 await msg.edit_text(
-                    "😕 Ничего не найдено после фильтра по языку. "
-                    "Попробуйте убрать <code>lang:xx</code>.",
+                    "😕 Ничего не найдено после фильтра по языку.",
                     parse_mode="HTML"
                 )
                 return
@@ -675,7 +694,7 @@ async def _do_search(msg, context, groups, exclude, limit, lang):
         stop_event.clear()
 
 
-# --- Веб-сервер для Render ---
+# --- Веб-сервер ---
 
 async def health_check(request):
     return web.Response(text="Bot is alive!")
@@ -692,7 +711,7 @@ async def start_web_server():
     logger.info(f"Веб-сервер для Render запущен на порту {port}")
 
 
-# --- Запуск бота ---
+# --- Запуск ---
 
 async def run_bot():
     application = (
@@ -704,6 +723,7 @@ async def run_bot():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("my_id", my_id))
     application.add_handler(CommandHandler("add_account", add_account))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("search", search))
